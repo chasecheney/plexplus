@@ -340,7 +340,10 @@ final class PlexAPI {
             s.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? s
         }
         // A per-playback session id is required by the universal transcoder.
+        // The parameter set mirrors what official Plex clients send - servers
+        // (and proxies in front of them) can reject sparser requests with 400.
         var params = [
+            "hasMDE=1",
             "path=" + enc("/library/metadata/\(item.ratingKey)"),
             "mediaIndex=0",
             "partIndex=0",
@@ -348,13 +351,22 @@ final class PlexAPI {
             "fastSeek=1",
             "directPlay=0",
             "directStream=1",
+            "directStreamAudio=1",
             "subtitles=auto",
+            "audioBoost=100",
+            "subtitleSize=100",
+            "location=wan",
+            "autoAdjustQuality=0",
+            "mediaBufferSize=102400",
             "videoQuality=100",
             "session=" + enc(session),
             "X-Plex-Session-Identifier=" + enc(session),
             "X-Plex-Client-Identifier=" + enc(clientID),
             "X-Plex-Product=" + enc(product),
+            "X-Plex-Version=" + enc(version),
             "X-Plex-Platform=" + enc(platform),
+            "X-Plex-Device=" + enc(device),
+            "X-Plex-Device-Name=" + enc(device),
             "X-Plex-Token=" + enc(token),
         ]
         if let bitrate = quality.maxVideoBitrateKbps {
@@ -365,6 +377,33 @@ final class PlexAPI {
         }
         return URL(string: base.absoluteString + "/video/:/transcode/universal/start.m3u8?"
                    + params.joined(separator: "&"))
+    }
+
+    /// Asks the server to explain its transcode decision for the same request
+    /// the player is about to make. Purely diagnostic: the structured verdict
+    /// (or refusal) lands in the network log.
+    func logTranscodeDecision(base: URL, token: String, item: PlexMetadata,
+                              quality: PlexQuality, session: String) async {
+        guard let startURL = transcodeURL(base: base, token: token, item: item,
+                                          quality: quality, session: session),
+              var comps = URLComponents(string: base.absoluteString + "/video/:/transcode/universal/decision")
+        else { return }
+        comps.percentEncodedQuery = URLComponents(url: startURL, resolvingAgainstBaseURL: false)?.percentEncodedQuery
+        guard let url = comps.url else { return }
+        var req = URLRequest(url: url, timeoutInterval: 30)
+        for (k, v) in headers(token: token) { req.setValue(v, forHTTPHeaderField: k) }
+        let start = Date()
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            NetworkLog.record(url: url, start: start,
+                              status: (resp as? HTTPURLResponse)?.statusCode, bytes: data.count,
+                              detail: String(data: data.prefix(300), encoding: .utf8),
+                              label: "Transcode decision")
+        } catch {
+            NetworkLog.record(url: url, start: start,
+                              error: (error as NSError).localizedDescription,
+                              label: "Transcode decision")
+        }
     }
 
     /// Tells the server to stop a universal-transcode session so it doesn't keep

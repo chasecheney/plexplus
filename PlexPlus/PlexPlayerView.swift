@@ -830,6 +830,10 @@ final class PlexPlayerViewModel: ObservableObject {
         guard let url = chosenURL else { return }
         NetworkLog.record(url: url, start: Date(),
                           label: transcoding ? "AVPlayer start (transcode)" : "AVPlayer start (direct play)")
+        if transcoding {
+            Task { await api.logTranscodeDecision(base: base, token: token, item: item,
+                                                  quality: quality, session: session) }
+        }
 
         // Report the outgoing item as stopped and stop its transcode session.
         reportTimeline("stopped")
