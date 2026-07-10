@@ -32,6 +32,12 @@ final class PlexAPI {
     let device = "PlexPlus (iPad)"
     #endif
 
+    /// Platform name used for transcode requests. PMS resolves the client
+    /// profile from X-Plex-Platform and ships no "macOS" profile, so such
+    /// requests fail with "unable to find client profile" (HTTP 400). The
+    /// iOS profile is HLS-native and matches AVFoundation on both platforms.
+    let transcodeProfilePlatform = "iOS"
+
     init() {
         if let existing = KeychainHelper.get("plex.clientId") {
             clientID = existing
@@ -365,7 +371,7 @@ final class PlexAPI {
             "X-Plex-Client-Identifier=" + enc(clientID),
             "X-Plex-Product=" + enc(product),
             "X-Plex-Version=" + enc(version),
-            "X-Plex-Platform=" + enc(platform),
+            "X-Plex-Platform=" + enc(transcodeProfilePlatform),
             "X-Plex-Device=" + enc(device),
             "X-Plex-Device-Name=" + enc(device),
             "X-Plex-Token=" + enc(token),
