@@ -402,7 +402,8 @@ final class PlexPlayerViewModel: ObservableObject {
     func runTranscodeProbe() {
         guard let base = baseURL, let token = serverToken,
               let item = lastFailedItem ?? onDeck.first ?? recentlyAdded.first else { return }
-        Task { await api.runTranscodeProbe(base: base, token: token, item: item) }
+        let alts = (selectedServer?.connections ?? []).compactMap { URL(string: $0.uri) }
+        Task { await api.runTranscodeProbe(base: base, token: token, item: item, altBases: alts) }
     }
 
     /// Drops cached connections and re-runs server discovery — useful after
@@ -1044,7 +1045,8 @@ final class PlexPlayerViewModel: ObservableObject {
         } else {
             lastFailedItem = item
             NetworkLog.record(url: url, start: Date(), error: message, label: "AVPlayer FAILED")
-            playbackAlert = "Couldn't play \u{201C}\(item.title)\u{201D}: \(message)"
+            let containerInfo = item.partContainer.map { " (\($0) file)" } ?? ""
+            playbackAlert = "Couldn't play \u{201C}\(item.title)\u{201D}\(containerInfo): \(message)"
                 + (activeConnectionInfo.map { "\n\nConnection: \($0)" } ?? "")
             closePlayer()
             Task { await appendServerDiagnostics(for: url) }
@@ -1071,7 +1073,11 @@ final class PlexPlayerViewModel: ObservableObject {
             detail = "Follow-up request failed: \((error as NSError).localizedDescription)"
         }
         NetworkLog.record(url: url, start: Date(), detail: detail, label: "Playback diagnostics")
-        if playbackAlert != nil { playbackAlert! += "\n\n\(detail)" }
+        var message = detail
+        if detail.contains("HTTP 400"), url.path.contains("/transcode/") {
+            message += "\n\nThe server refused to start a transcode. Files that can't direct-play (like MKV or AVI) need server transcoding; mp4/mov/m4v files play without it. If this is a hosted server, the provider may block transcoding."
+        }
+        if playbackAlert != nil { playbackAlert! += "\n\n\(message)" }
     }
 
     private func observeTime(_ player: AVPlayer) {

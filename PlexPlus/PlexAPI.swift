@@ -323,15 +323,16 @@ final class PlexAPI {
         return transcodeURL(base: base, token: token, item: item, quality: quality, session: session)
     }
 
-    /// Whether AVFoundation can most likely play the file as-is.
+    /// Whether AVFoundation can most likely play the file as-is. The container
+    /// is the deciding factor: AVPlayer opens mp4/mov/m4v and natively handles
+    /// the codecs commonly inside them (H.264/HEVC video; AAC/MP3/ALAC and
+    /// AC-3/E-AC-3 audio). Plex codec metadata is often missing or wrong, and
+    /// being strict here forces an unnecessary transcode - which some hosts
+    /// block outright - so err on the side of direct play; a real playback
+    /// failure automatically falls back to the transcoder.
     func canDirectPlay(_ item: PlexMetadata) -> Bool {
-        guard let container = item.partContainer?.lowercased(),
-              ["mp4", "mov", "m4v"].contains(container) else { return false }
-        let video = item.media?.first?.videoCodec?.lowercased()
-        let audio = item.media?.first?.audioCodec?.lowercased()
-        let okVideo = video.map { ["h264", "hevc", "h265", "mpeg4"].contains($0) } ?? false
-        let okAudio = audio.map { ["aac", "mp3", "alac"].contains($0) } ?? true
-        return okVideo && okAudio
+        guard let container = item.partContainer?.lowercased() else { return false }
+        return ["mp4", "mov", "m4v"].contains(container)
     }
 
     func transcodeURL(base: URL, token: String, item: PlexMetadata,
@@ -383,7 +384,8 @@ final class PlexAPI {
     /// and encodings, logging each result - a one-button experiment to find
     /// which shape (if any) this server accepts. Results appear in the
     /// Network Log labeled "probe ...".
-    func runTranscodeProbe(base: URL, token: String, item: PlexMetadata) async {
+    func runTranscodeProbe(base: URL, token: String, item: PlexMetadata,
+                           altBases: [URL] = []) async {
         func enc(_ s: String) -> String {
             s.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? s
         }
@@ -407,7 +409,7 @@ final class PlexAPI {
             "X-Plex-Platform=" + enc(platform),
             "X-Plex-Token=" + enc(token),
         ].joined(separator: "&")))
-        variants.append(("probe v2 (v1 + unreserved encoding)", [
+        let v2Query = [
             "path=" + encU(path), "mediaIndex=0", "partIndex=0", "protocol=hls",
             "fastSeek=1", "directPlay=0", "directStream=1", "subtitles=burn",
             "videoQuality=100", "maxVideoBitrate=20000",
@@ -416,7 +418,8 @@ final class PlexAPI {
             "X-Plex-Product=" + encU(product),
             "X-Plex-Platform=" + encU(platform),
             "X-Plex-Token=" + encU(token),
-        ].joined(separator: "&")))
+        ].joined(separator: "&")
+        variants.append(("probe v2 (v1 + unreserved encoding)", v2Query))
         variants.append(("probe v3 (minimal)", [
             "path=" + encU(path), "protocol=hls",
             "X-Plex-Client-Identifier=" + encU(clientID),
@@ -438,6 +441,30 @@ final class PlexAPI {
             } catch {
                 NetworkLog.record(url: url, start: start,
                                   error: (error as NSError).localizedDescription, label: label)
+            }
+        }
+        // The same canonical request via every other advertised connection -
+        // a broken proxy on one address doesn't affect the others.
+        await withTaskGroup(of: Void.self) { group in
+            for alt in altBases where alt.absoluteString != base.absoluteString {
+                group.addTask { [self] in
+                    guard let url = URL(string: alt.absoluteString
+                                        + "/video/:/transcode/universal/start.m3u8?" + v2Query) else { return }
+                    var req = URLRequest(url: url, timeoutInterval: 10)
+                    for (k, v) in headers(token: token) { req.setValue(v, forHTTPHeaderField: k) }
+                    let start = Date()
+                    do {
+                        let (data, resp) = try await URLSession.shared.data(for: req)
+                        NetworkLog.record(url: url, start: start,
+                                          status: (resp as? HTTPURLResponse)?.statusCode, bytes: data.count,
+                                          detail: String(data: data.prefix(200), encoding: .utf8),
+                                          label: "probe via \(alt.host ?? "alt"):\(alt.port ?? 32400)")
+                    } catch {
+                        NetworkLog.record(url: url, start: start,
+                                          error: (error as NSError).localizedDescription,
+                                          label: "probe via \(alt.host ?? "alt"):\(alt.port ?? 32400)")
+                    }
+                }
             }
         }
         // Best-effort cleanup of any session the probes started.
