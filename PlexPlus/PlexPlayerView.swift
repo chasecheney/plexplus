@@ -1233,8 +1233,7 @@ private struct BrowseView: View {
             .fixedSize()
         }
         .padding(.leading, 12).padding(.vertical, 8)
-        // Reserve the top-right corner for the pane's container picker.
-        .padding(.trailing, containerPickerReservedWidth)
+        .padding(.trailing, 12)
         .background(.bar)
     }
 }
@@ -1936,8 +1935,7 @@ private struct FullPlayerView: View {
         .buttonStyle(.plain)
         .foregroundStyle(.white)
         .padding(.leading, 20).padding(.vertical, 12)
-        // Reserve the top-right corner for the pane's container picker.
-        .padding(.trailing, containerPickerReservedWidth + 12)
+        .padding(.trailing, 20)
         .background(
             LinearGradient(colors: [.black.opacity(0.7), .clear], startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea(edges: .top)
