@@ -41,6 +41,18 @@ struct NetStat: Equatable {
 
 // MARK: - View model
 
+/// Formats an AVFoundation playback error (with its underlying error code)
+/// for display. File-scope so it's nonisolated and callable from KVO and
+/// notification closures.
+private func describePlaybackError(_ error: Error?) -> String {
+    guard let ns = error as NSError? else { return "Unknown playback error." }
+    var text = ns.localizedDescription
+    if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+        text += " [\(underlying.domain) \(underlying.code)]"
+    }
+    return text
+}
+
 @MainActor
 final class PlexPlayerViewModel: ObservableObject {
     enum Phase: Equatable {
@@ -921,18 +933,9 @@ final class PlexPlayerViewModel: ObservableObject {
         failedToEndObserver = nil
         guard let playerItem = player.currentItem else { return }
 
-        func describe(_ error: Error?) -> String {
-            guard let ns = error as NSError? else { return "Unknown playback error." }
-            var text = ns.localizedDescription
-            if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
-                text += " [\(underlying.domain) \(underlying.code)]"
-            }
-            return text
-        }
-
         itemErrorObservation = playerItem.observe(\.status, options: [.new]) { [weak self] observed, _ in
             guard observed.status == .failed else { return }
-            let message = describe(observed.error)
+            let message = describePlaybackError(observed.error)
             Task { @MainActor in
                 self?.handlePlaybackFailure(message: message, wasDirectPlay: wasDirectPlay,
                                             item: item, generation: generation)
@@ -941,7 +944,7 @@ final class PlexPlayerViewModel: ObservableObject {
         failedToEndObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemFailedToPlayToEndTime, object: playerItem, queue: .main
         ) { [weak self] note in
-            let message = describe(note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)
+            let message = describePlaybackError(note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)
             Task { @MainActor in
                 self?.handlePlaybackFailure(message: message, wasDirectPlay: wasDirectPlay,
                                             item: item, generation: generation)
