@@ -159,6 +159,12 @@ final class PlexPlayerViewModel: ObservableObject {
     private var statusObservation: NSKeyValueObservation?
     private var endObserver: NSObjectProtocol?
     private var timeObserver: Any?
+    private var itemErrorObservation: NSKeyValueObservation?
+    private var failedToEndObserver: NSObjectProtocol?
+    private var forceTranscodeNext = false
+
+    /// Human-readable playback failure, surfaced as an alert.
+    @Published var playbackAlert: String?
 
     // Live scrubbing (chase-time coalescing so drags don't flood seeks).
     private var isSeekInProgress = false
@@ -739,8 +745,12 @@ final class PlexPlayerViewModel: ObservableObject {
         guard generation == playbackGeneration else { return } // a newer call won
 
         let session = UUID().uuidString
-        let transcoding = api.willTranscode(item: item, quality: quality)
-        guard let url = api.playbackURL(base: base, token: token, item: item, quality: quality, session: session) else { return }
+        let transcoding = forceTranscodeNext || api.willTranscode(item: item, quality: quality)
+        let chosenURL: URL? = forceTranscodeNext
+            ? api.transcodeURL(base: base, token: token, item: item, quality: quality, session: session)
+            : api.playbackURL(base: base, token: token, item: item, quality: quality, session: session)
+        forceTranscodeNext = false
+        guard let url = chosenURL else { return }
 
         // Report the outgoing item as stopped and stop its transcode session.
         reportTimeline("stopped")
@@ -752,6 +762,10 @@ final class PlexPlayerViewModel: ObservableObject {
         statusObservation = nil
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         endObserver = nil
+        itemErrorObservation?.invalidate()
+        itemErrorObservation = nil
+        if let failedToEndObserver { NotificationCenter.default.removeObserver(failedToEndObserver) }
+        failedToEndObserver = nil
         if let existing = self.player {
             if let timeObserver { existing.removeTimeObserver(timeObserver) }
             timeObserver = nil
@@ -777,6 +791,7 @@ final class PlexPlayerViewModel: ObservableObject {
             : item.title
         observePlayback(player)
         observeEnd(of: player)
+        observeFailures(of: player, wasDirectPlay: !transcoding, item: item, generation: generation)
         withAnimation(.easeInOut(duration: 0.25)) {
             self.player = player
             isPlayerMinimized = false
@@ -896,6 +911,59 @@ final class PlexPlayerViewModel: ObservableObject {
         }
     }
 
+    /// Watches the current item for hard failures. AVPlayer reports these via
+    /// the item's status and a failed-to-end notification, not via
+    /// timeControlStatus - without this a failed video is just a black screen.
+    private func observeFailures(of player: AVPlayer, wasDirectPlay: Bool,
+                                 item: PlexMetadata, generation: Int) {
+        itemErrorObservation?.invalidate()
+        if let failedToEndObserver { NotificationCenter.default.removeObserver(failedToEndObserver) }
+        failedToEndObserver = nil
+        guard let playerItem = player.currentItem else { return }
+
+        func describe(_ error: Error?) -> String {
+            guard let ns = error as NSError? else { return "Unknown playback error." }
+            var text = ns.localizedDescription
+            if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+                text += " [\(underlying.domain) \(underlying.code)]"
+            }
+            return text
+        }
+
+        itemErrorObservation = playerItem.observe(\.status, options: [.new]) { [weak self] observed, _ in
+            guard observed.status == .failed else { return }
+            let message = describe(observed.error)
+            Task { @MainActor in
+                self?.handlePlaybackFailure(message: message, wasDirectPlay: wasDirectPlay,
+                                            item: item, generation: generation)
+            }
+        }
+        failedToEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime, object: playerItem, queue: .main
+        ) { [weak self] note in
+            let message = describe(note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)
+            Task { @MainActor in
+                self?.handlePlaybackFailure(message: message, wasDirectPlay: wasDirectPlay,
+                                            item: item, generation: generation)
+            }
+        }
+    }
+
+    private func handlePlaybackFailure(message: String, wasDirectPlay: Bool,
+                                       item: PlexMetadata, generation: Int) {
+        guard generation == playbackGeneration else { return } // stale player, already replaced
+        if wasDirectPlay {
+            // The file looked direct-playable but AVFoundation rejected it -
+            // retry once through the Plex transcoder.
+            forceTranscodeNext = true
+            let resume = currentTime > 5 ? CMTime(seconds: currentTime, preferredTimescale: 600) : nil
+            Task { await startPlayback(item, resumeAt: resume) }
+        } else {
+            playbackAlert = "Couldn't play \u{201C}\(item.title)\u{201D}: \(message)"
+            closePlayer()
+        }
+    }
+
     private func observeTime(_ player: AVPlayer) {
         let interval = CMTime(seconds: 0.5, preferredTimescale: 600)
         timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
@@ -1012,6 +1080,10 @@ final class PlexPlayerViewModel: ObservableObject {
         statusObservation = nil
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         endObserver = nil
+        itemErrorObservation?.invalidate()
+        itemErrorObservation = nil
+        if let failedToEndObserver { NotificationCenter.default.removeObserver(failedToEndObserver) }
+        failedToEndObserver = nil
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
         timeObserver = nil
         currentTime = 0
@@ -1121,6 +1193,13 @@ struct PlexPlayerContainerView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(model.deleteError ?? "")
+        }
+        .alert("Playback Error",
+               isPresented: Binding(get: { model.playbackAlert != nil },
+                                    set: { if !$0 { model.playbackAlert = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(model.playbackAlert ?? "")
         }
         .onAppear { model.start() }
     }
