@@ -99,6 +99,10 @@ final class PlexPlayerViewModel: ObservableObject {
     @Published private(set) var sections: [PlexDirectory] = []
     @Published private(set) var serverLibraries: [String: [PlexDirectory]] = [:]
 
+    /// Host + kind (local/remote/relay) of the connection in use, shown in
+    /// Settings and appended to playback errors for diagnostics.
+    @Published private(set) var activeConnectionInfo: String?
+
     // Library browsing
     @Published private(set) var mode: BrowseMode = .home
     @Published private(set) var stack: [BrowseLevel] = []
@@ -256,6 +260,7 @@ final class PlexPlayerViewModel: ObservableObject {
         onDeck = []
         recentlyAdded = []
         serverLibraries = [:]
+        activeConnectionInfo = nil
         mode = .home
         stack = []
         recommendedHubs = []
@@ -293,8 +298,16 @@ final class PlexPlayerViewModel: ObservableObject {
                 baseURL = base
                 serverToken = cached.token
                 connectionCache[cached.serverID] = (base, cached.token)
+                activeConnectionInfo = describeConnection(base: base, serverID: cached.serverID)
                 await loadHome()
-                Task { await refreshServers(preferredID: cached.serverID) }
+                Task {
+                    await refreshServers(preferredID: cached.serverID)
+                    // With the server list loaded we can label the connection,
+                    // and switch to a better one (e.g. local instead of relay)
+                    // if it is reachable now.
+                    activeConnectionInfo = describeConnection(base: base, serverID: cached.serverID)
+                    await upgradeConnectionIfBetter(serverID: cached.serverID, currentBase: base)
+                }
                 return
             }
         }
@@ -355,6 +368,50 @@ final class PlexPlayerViewModel: ObservableObject {
         return reachable
     }
 
+    /// "host:port (local/remote/relay)" for the given base URL, best effort.
+    private func describeConnection(base: URL, serverID: String) -> String {
+        var host = base.host ?? base.absoluteString
+        if let port = base.port { host += ":\(port)" }
+        guard let server = servers.first(where: { $0.clientIdentifier == serverID }),
+              let match = server.connections?.first(where: { $0.uri == base.absoluteString }) else {
+            return host
+        }
+        let kind = match.relay == true ? "relay" : (match.local ? "local" : "remote")
+        return "\(host) (\(kind))"
+    }
+
+    /// Re-runs connection selection in the background; if a better connection
+    /// responds now (e.g. local instead of relay, after the user granted
+    /// local-network permission), switch future requests to it.
+    private func upgradeConnectionIfBetter(serverID: String, currentBase: URL) async {
+        guard let server = servers.first(where: { $0.clientIdentifier == serverID }),
+              let fresh = await api.reachableBaseURL(for: server),
+              fresh.base != currentBase else { return }
+        connectionCache[serverID] = fresh
+        if baseURL == currentBase {
+            baseURL = fresh.base
+            serverToken = fresh.token
+            activeConnectionInfo = describeConnection(base: fresh.base, serverID: serverID)
+            saveCachedConnection(serverID: serverID, name: server.name, base: fresh.base, token: fresh.token)
+        }
+    }
+
+    /// Drops cached connections and re-runs server discovery — useful after
+    /// granting local-network permission or when the server moved.
+    func reconnect() {
+        connectionCache = [:]
+        KeychainHelper.delete("plex.lastConnection")
+        showSettings = false
+        Task {
+            await Task.yield()
+            if let server = selectedServer ?? servers.first {
+                await select(server: server)
+            } else {
+                await connect()
+            }
+        }
+    }
+
     func select(server: PlexResource) async {
         selectedServer = server
         phase = .loading("Connecting to \(server.name)…")
@@ -364,6 +421,7 @@ final class PlexPlayerViewModel: ObservableObject {
         }
         baseURL = conn.base
         serverToken = conn.token
+        activeConnectionInfo = describeConnection(base: conn.base, serverID: server.clientIdentifier)
         saveCachedConnection(serverID: server.clientIdentifier, name: server.name, base: conn.base, token: conn.token)
         await loadHome()
     }
@@ -431,6 +489,7 @@ final class PlexPlayerViewModel: ObservableObject {
             baseURL = conn.base
             serverToken = conn.token
             selectedServer = servers.first { $0.clientIdentifier == ref.serverID }
+            activeConnectionInfo = describeConnection(base: conn.base, serverID: ref.serverID)
             saveCachedConnection(serverID: ref.serverID, name: ref.serverName, base: conn.base, token: conn.token)
             mode = .library(ref)
             stack = []
@@ -969,6 +1028,7 @@ final class PlexPlayerViewModel: ObservableObject {
             Task { await startPlayback(item, resumeAt: resume) }
         } else {
             playbackAlert = "Couldn't play \u{201C}\(item.title)\u{201D}: \(message)"
+                + (activeConnectionInfo.map { "\n\nConnection: \($0)" } ?? "")
             closePlayer()
         }
     }
@@ -2212,6 +2272,16 @@ private struct PlexSettingsView: View {
                     Text("Playback")
                 } footer: {
                     Text("Default quality when a video starts. You can still change it during playback.")
+                }
+
+                Section {
+                    LabeledContent("Server", value: model.selectedServer?.name ?? "\u{2014}")
+                    LabeledContent("Connection", value: model.activeConnectionInfo ?? "\u{2014}")
+                    Button("Reconnect") { model.reconnect() }
+                } header: {
+                    Text("Connection")
+                } footer: {
+                    Text("Videos often fail on a relay connection. If the connection shows \u{201C}relay\u{201D}, allow this app under System Settings \u{2192} Privacy & Security \u{2192} Local Network, then press Reconnect.")
                 }
 
                 Section("Display") {
