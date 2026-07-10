@@ -2011,6 +2011,13 @@ private struct FullPlayerView: View {
     @GestureState private var pinch: CGFloat = 1.0
     private let maxZoom: CGFloat = 4.0
 
+    // Pan state while zoomed in.
+    @State private var pan: CGSize = .zero
+    @GestureState private var dragPan: CGSize = .zero
+    #if os(macOS)
+    @State private var isFullScreen = false
+    #endif
+
     // Scrubber state.
     @State private var scrubbing = false
     @State private var scrubValue: Double = 0
@@ -2021,13 +2028,25 @@ private struct FullPlayerView: View {
 
     private var effectiveScale: CGFloat { min(max(zoom * pinch, 1.0), maxZoom) }
 
+    /// Limits panning so the zoomed video can't be dragged past its edges.
+    private func clampedPan(_ proposed: CGSize, scale: CGFloat, in size: CGSize) -> CGSize {
+        let maxX = max(0, (scale - 1) * size.width / 2)
+        let maxY = max(0, (scale - 1) * size.height / 2)
+        return CGSize(width: min(max(proposed.width, -maxX), maxX),
+                      height: min(max(proposed.height, -maxY), maxY))
+    }
+
     var body: some View {
         GeometryReader { geo in
             ZStack {
                 Color.black.ignoresSafeArea()
                 if let player = model.player {
+                    let panOffset = clampedPan(
+                        CGSize(width: pan.width + dragPan.width, height: pan.height + dragPan.height),
+                        scale: effectiveScale, in: geo.size)
                     PlayerLayerView(player: player)
                         .scaleEffect(effectiveScale)
+                        .offset(x: panOffset.width, y: panOffset.height)
                         .ignoresSafeArea()
                         .gesture(
                             MagnifyGesture()
@@ -2035,6 +2054,22 @@ private struct FullPlayerView: View {
                                 .onEnded { value in
                                     zoom = min(max(zoom * value.magnification, 1.0), maxZoom)
                                     if zoom < 1.05 { zoom = 1.0 }
+                                    // Keep the pan inside the new zoom's bounds.
+                                    pan = zoom <= 1.01 ? .zero : clampedPan(pan, scale: zoom, in: geo.size)
+                                }
+                        )
+                        // Drag to pan while zoomed in (min distance keeps taps working).
+                        .simultaneousGesture(
+                            DragGesture(minimumDistance: 12, coordinateSpace: .named("player"))
+                                .updating($dragPan) { value, state, _ in
+                                    if zoom > 1.01 { state = value.translation }
+                                }
+                                .onEnded { value in
+                                    guard zoom > 1.01 else { return }
+                                    pan = clampedPan(
+                                        CGSize(width: pan.width + value.translation.width,
+                                               height: pan.height + value.translation.height),
+                                        scale: zoom, in: geo.size)
                                 }
                         )
                         // Double-tap left half = back 15s, right half = forward 15s.
@@ -2054,6 +2089,15 @@ private struct FullPlayerView: View {
         }
         .clipped()
         .animation(.easeOut(duration: 0.15), value: zoom)
+        #if os(macOS)
+        .onAppear { isFullScreen = NSApp.keyWindow?.styleMask.contains(.fullScreen) ?? false }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
+            isFullScreen = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in
+            isFullScreen = false
+        }
+        #endif
     }
 
     private func doubleTapSeek(x: CGFloat, width: CGFloat) {
@@ -2148,11 +2192,22 @@ private struct FullPlayerView: View {
             .help("Playback quality")
 
             if zoom > 1.01 {
-                Button { withAnimation(.easeOut(duration: 0.2)) { zoom = 1.0 } } label: {
+                Button {
+                    withAnimation(.easeOut(duration: 0.2)) { zoom = 1.0; pan = .zero }
+                } label: {
                     Image(systemName: "arrow.down.right.and.arrow.up.left").font(.title3)
                 }
                 .help("Reset zoom")
             }
+
+            #if os(macOS)
+            Button { NSApp.keyWindow?.toggleFullScreen(nil) } label: {
+                Image(systemName: isFullScreen
+                      ? "rectangle.arrowtriangle.2.inward" : "rectangle.arrowtriangle.2.outward")
+                    .font(.title3)
+            }
+            .help(isFullScreen ? "Exit Full Screen" : "Enter Full Screen")
+            #endif
 
             Button { model.showQueue = true } label: { Image(systemName: "line.3.horizontal").font(.title3) }
                 .help("Queue")
