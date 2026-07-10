@@ -828,6 +828,8 @@ final class PlexPlayerViewModel: ObservableObject {
             : api.playbackURL(base: base, token: token, item: item, quality: quality, session: session)
         forceTranscodeNext = false
         guard let url = chosenURL else { return }
+        NetworkLog.record(url: url, start: Date(),
+                          label: transcoding ? "AVPlayer start (transcode)" : "AVPlayer start (direct play)")
 
         // Report the outgoing item as stopped and stop its transcode session.
         reportTimeline("stopped")
@@ -1027,6 +1029,7 @@ final class PlexPlayerViewModel: ObservableObject {
             let resume = currentTime > 5 ? CMTime(seconds: currentTime, preferredTimescale: 600) : nil
             Task { await startPlayback(item, resumeAt: resume) }
         } else {
+            NetworkLog.record(url: url, start: Date(), error: message, label: "AVPlayer FAILED")
             playbackAlert = "Couldn't play \u{201C}\(item.title)\u{201D}: \(message)"
                 + (activeConnectionInfo.map { "\n\nConnection: \($0)" } ?? "")
             closePlayer()
@@ -1053,6 +1056,7 @@ final class PlexPlayerViewModel: ObservableObject {
         } catch {
             detail = "Follow-up request failed: \((error as NSError).localizedDescription)"
         }
+        NetworkLog.record(url: url, start: Date(), detail: detail, label: "Playback diagnostics")
         if playbackAlert != nil { playbackAlert! += "\n\n\(detail)" }
     }
 
@@ -2281,6 +2285,7 @@ private struct PlexSettingsView: View {
     @ObservedObject var model: PlexPlayerViewModel
     @ObservedObject private var prefs = PlexPreferences.shared
     @Environment(\.dismiss) private var dismiss
+    @State private var showNetworkLog = false
 
     var body: some View {
         NavigationStack {
@@ -2311,6 +2316,7 @@ private struct PlexSettingsView: View {
                     Toggle("Network debug overlay",
                            isOn: Binding(get: { prefs.showNetworkDebug },
                                          set: { prefs.setShowNetworkDebug($0) }))
+                    Button("Network Log\u{2026}") { showNetworkLog = true }
                 }
 
                 Section {
@@ -2325,6 +2331,7 @@ private struct PlexSettingsView: View {
             }
             .navigationTitle("Settings")
             .toolbar { ToolbarItem { Button("Done") { dismiss() } } }
+            .sheet(isPresented: $showNetworkLog) { NetworkLogView() }
         }
         .frame(minWidth: 420, minHeight: 440)
     }

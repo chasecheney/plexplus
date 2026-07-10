@@ -66,10 +66,28 @@ final class PlexAPI {
         for (k, v) in headers(token: token) { req.setValue(v, forHTTPHeaderField: k) }
         if let contentType { req.setValue(contentType, forHTTPHeaderField: "Content-Type") }
         req.httpBody = body
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse else { throw PlexError.badResponse }
-        guard (200..<300).contains(http.statusCode) else { throw PlexError.http(http.statusCode) }
-        return data
+        let start = Date()
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse else {
+                NetworkLog.record(method: method, url: url, start: start,
+                                  bytes: data.count, error: "No HTTP response")
+                throw PlexError.badResponse
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                NetworkLog.record(method: method, url: url, start: start, status: http.statusCode,
+                                  bytes: data.count, error: "HTTP \(http.statusCode)",
+                                  detail: String(data: data.prefix(300), encoding: .utf8))
+                throw PlexError.http(http.statusCode)
+            }
+            NetworkLog.record(method: method, url: url, start: start,
+                              status: http.statusCode, bytes: data.count)
+            return data
+        } catch let error where !(error is PlexError) {
+            NetworkLog.record(method: method, url: url, start: start,
+                              error: (error as NSError).localizedDescription)
+            throw error
+        }
     }
 
     private func get<T: Decodable>(_ url: URL, token: String?, timeout: TimeInterval = 15) async throws -> T {
@@ -236,11 +254,23 @@ final class PlexAPI {
         var req = URLRequest(url: url, timeoutInterval: timeout)
         for (k, v) in headers(token: token) { req.setValue(v, forHTTPHeaderField: k) }
         let observer = PlexProgressObserver(onResponse: onResponse, onProgress: onProgress)
-        let (data, resp) = try await URLSession.shared.data(for: req, delegate: observer)
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw PlexError.http((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        let start = Date()
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req, delegate: observer)
+            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                let status = (resp as? HTTPURLResponse)?.statusCode
+                NetworkLog.record(url: url, start: start, status: status,
+                                  bytes: data.count, error: "HTTP \(status ?? -1)",
+                                  detail: String(data: data.prefix(300), encoding: .utf8))
+                throw PlexError.http(status ?? -1)
+            }
+            NetworkLog.record(url: url, start: start, status: http.statusCode, bytes: data.count)
+            return data
+        } catch let error where !(error is PlexError) {
+            NetworkLog.record(url: url, start: start,
+                              error: (error as NSError).localizedDescription)
+            throw error
         }
-        return data
     }
 
     /// Full metadata for one item (includes Media/Part technical fields + file path).
