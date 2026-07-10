@@ -2324,7 +2324,13 @@ private struct PlexSettingsView: View {
 
                 Section {
                     LabeledContent("Server", value: model.selectedServer?.name ?? "\u{2014}")
-                    LabeledContent("Connection", value: model.activeConnectionInfo ?? "\u{2014}")
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Connection")
+                        Text(model.activeConnectionInfo ?? "\u{2014}")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
                     Button("Reconnect") { model.reconnect() }
                 } header: {
                     Text("Connection")
@@ -2350,11 +2356,12 @@ private struct PlexSettingsView: View {
                     Text("Adds a delete action to the media info screen. Deleting also requires “Allow media deletion” to be enabled on the Plex server.")
                 }
             }
+            .formStyle(.grouped)
             .navigationTitle("Settings")
             .toolbar { ToolbarItem { Button("Done") { dismiss() } } }
             .sheet(isPresented: $showNetworkLog) { NetworkLogView() }
         }
-        .frame(minWidth: 420, minHeight: 440)
+        .frame(minWidth: 540, minHeight: 580)
     }
 }
 
