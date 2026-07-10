@@ -868,7 +868,7 @@ final class PlexPlayerViewModel: ObservableObject {
             : item.title
         observePlayback(player)
         observeEnd(of: player)
-        observeFailures(of: player, wasDirectPlay: !transcoding, item: item, generation: generation)
+        observeFailures(of: player, url: url, wasDirectPlay: !transcoding, item: item, generation: generation)
         withAnimation(.easeInOut(duration: 0.25)) {
             self.player = player
             isPlayerMinimized = false
@@ -991,7 +991,7 @@ final class PlexPlayerViewModel: ObservableObject {
     /// Watches the current item for hard failures. AVPlayer reports these via
     /// the item's status and a failed-to-end notification, not via
     /// timeControlStatus - without this a failed video is just a black screen.
-    private func observeFailures(of player: AVPlayer, wasDirectPlay: Bool,
+    private func observeFailures(of player: AVPlayer, url: URL, wasDirectPlay: Bool,
                                  item: PlexMetadata, generation: Int) {
         itemErrorObservation?.invalidate()
         if let failedToEndObserver { NotificationCenter.default.removeObserver(failedToEndObserver) }
@@ -1002,7 +1002,7 @@ final class PlexPlayerViewModel: ObservableObject {
             guard observed.status == .failed else { return }
             let message = describePlaybackError(observed.error)
             Task { @MainActor in
-                self?.handlePlaybackFailure(message: message, wasDirectPlay: wasDirectPlay,
+                self?.handlePlaybackFailure(message: message, url: url, wasDirectPlay: wasDirectPlay,
                                             item: item, generation: generation)
             }
         }
@@ -1011,13 +1011,13 @@ final class PlexPlayerViewModel: ObservableObject {
         ) { [weak self] note in
             let message = describePlaybackError(note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)
             Task { @MainActor in
-                self?.handlePlaybackFailure(message: message, wasDirectPlay: wasDirectPlay,
+                self?.handlePlaybackFailure(message: message, url: url, wasDirectPlay: wasDirectPlay,
                                             item: item, generation: generation)
             }
         }
     }
 
-    private func handlePlaybackFailure(message: String, wasDirectPlay: Bool,
+    private func handlePlaybackFailure(message: String, url: URL, wasDirectPlay: Bool,
                                        item: PlexMetadata, generation: Int) {
         guard generation == playbackGeneration else { return } // stale player, already replaced
         if wasDirectPlay {
@@ -1030,7 +1030,30 @@ final class PlexPlayerViewModel: ObservableObject {
             playbackAlert = "Couldn't play \u{201C}\(item.title)\u{201D}: \(message)"
                 + (activeConnectionInfo.map { "\n\nConnection: \($0)" } ?? "")
             closePlayer()
+            Task { await appendServerDiagnostics(for: url) }
         }
+    }
+
+    /// Re-fetches the failed stream URL with URLSession to capture the HTTP
+    /// status and the server's error body (Plex explains transcode refusals in
+    /// XML), then appends that to the visible alert. The token stays out of
+    /// the message.
+    private func appendServerDiagnostics(for url: URL) async {
+        let req = URLRequest(url: url, timeoutInterval: 15)
+        let detail: String
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            let body = String(data: data.prefix(300), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let looksLikePlaylist = body.hasPrefix("#EXTM3U")
+            detail = looksLikePlaylist
+                ? "Server answered HTTP \(status) with a valid playlist - the failure is happening on the media segments."
+                : "Server answered HTTP \(status)" + (body.isEmpty ? "." : ":\n\(body)")
+        } catch {
+            detail = "Follow-up request failed: \((error as NSError).localizedDescription)"
+        }
+        if playbackAlert != nil { playbackAlert! += "\n\n\(detail)" }
     }
 
     private func observeTime(_ player: AVPlayer) {
