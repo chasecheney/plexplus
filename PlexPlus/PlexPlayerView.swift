@@ -2026,6 +2026,9 @@ private struct FullPlayerView: View {
     @State private var seekFlash: Int?
     @State private var seekFlashID = UUID()
 
+    // Controls visibility (tap the video to toggle).
+    @State private var controlsVisible = true
+
     private var effectiveScale: CGFloat { min(max(zoom * pinch, 1.0), maxZoom) }
 
     /// Limits panning so the zoomed video can't be dragged past its edges.
@@ -2072,22 +2075,32 @@ private struct FullPlayerView: View {
                                         scale: zoom, in: geo.size)
                                 }
                         )
-                        // Double-tap left half = back 15s, right half = forward 15s.
+                        // Double-tap left half = back 15s, right half = forward 15s;
+                        // a single tap shows/hides the controls.
                         .simultaneousGesture(
                             SpatialTapGesture(count: 2, coordinateSpace: .named("player"))
                                 .onEnded { value in doubleTapSeek(x: value.location.x, width: geo.size.width) }
+                                .exclusively(before: TapGesture().onEnded {
+                                    withAnimation(.easeInOut(duration: 0.2)) { controlsVisible.toggle() }
+                                })
                         )
                 }
                 seekFeedbackOverlay
-                VStack(spacing: 0) {
-                    controlBar
-                    Spacer(minLength: 0)
-                    transportBar
+                if controlsVisible {
+                    VStack(spacing: 0) {
+                        controlBar
+                        Spacer(minLength: 0)
+                        transportBar
+                    }
+                    .transition(.opacity)
                 }
             }
             .coordinateSpace(name: "player")
         }
         .clipped()
+        // .clipped() cuts the video at the safe-area bounds; keep the exposed
+        // safe-area regions black so no UI shows through (visible on iPad).
+        .background(Color.black.ignoresSafeArea())
         .animation(.easeOut(duration: 0.15), value: zoom)
         #if os(macOS)
         .onAppear { isFullScreen = NSApp.keyWindow?.styleMask.contains(.fullScreen) ?? false }
