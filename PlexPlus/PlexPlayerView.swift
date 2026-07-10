@@ -149,6 +149,12 @@ final class PlexPlayerViewModel: ObservableObject {
     private var baseURL: URL?
     private var serverToken: String?
     private var connectionCache: [String: (base: URL, token: String)] = [:]
+
+    /// Bumped whenever the target of the home screen changes (server switch,
+    /// library selection, sign-out) so an in-flight `loadHome` for the previous
+    /// server can detect it was superseded and discard its results instead of
+    /// stomping the new server's data.
+    private var homeEpoch = 0
     private var pollTask: Task<Void, Never>?
     private var statusObservation: NSKeyValueObservation?
     private var endObserver: NSObjectProtocol?
@@ -225,6 +231,7 @@ final class PlexPlayerViewModel: ObservableObject {
         baseURL = nil
         serverToken = nil
         connectionCache = [:]
+        homeEpoch += 1 // invalidate any in-flight home load
         servers = []
         selectedServer = nil
         sections = []
@@ -336,15 +343,23 @@ final class PlexPlayerViewModel: ObservableObject {
 
     func loadHome() async {
         guard let base = baseURL, let token = serverToken else { return }
+        homeEpoch += 1
+        let epoch = homeEpoch
         phase = .loading("Loading your library…")
         mode = .home
         stack = []
         async let deck = try? api.onDeck(base: base, token: token)
         async let recent = try? api.recentlyAdded(base: base, token: token)
         async let secs = try? api.sections(base: base, token: token)
-        onDeck = await deck ?? []
-        recentlyAdded = await recent ?? []
-        sections = await secs ?? []
+        let newDeck = await deck ?? []
+        let newRecent = await recent ?? []
+        let newSections = await secs ?? []
+        // A newer selection superseded this load — drop the stale results so
+        // one server's libraries never populate another server's home screen.
+        guard epoch == homeEpoch else { return }
+        onDeck = newDeck
+        recentlyAdded = newRecent
+        sections = newSections
         phase = .browsing
     }
 
@@ -373,6 +388,7 @@ final class PlexPlayerViewModel: ObservableObject {
 
     func select(library ref: PlexLibraryRef) {
         showLibraryPicker = false
+        homeEpoch += 1 // invalidate any in-flight home load for the old server
         Task {
             phase = .loading("Loading \(ref.title)…")
             guard let conn = await connection(for: ref.serverID) else {
@@ -442,10 +458,13 @@ final class PlexPlayerViewModel: ObservableObject {
                         Task { @MainActor in self?.recommendedNet.bytes = bytes }
                     }
                 )
+                // Discard if the user switched libraries while we were loading.
+                guard currentLibrary?.id == ref.id else { return }
                 recommendedHubs = hubs.filter { ($0.metadata?.isEmpty == false) }
                 recommendedNet.phase = "done"
                 recommendedNet.finishedSeconds = Date().timeIntervalSince(start)
             } catch {
+                guard currentLibrary?.id == ref.id else { return }
                 recommendedNet.phase = "failed"
                 recommendedNet.error = classify(error)
                 recommendedNet.finishedSeconds = Date().timeIntervalSince(start)
@@ -455,10 +474,13 @@ final class PlexPlayerViewModel: ObservableObject {
     }
 
     func loadPlaylists() {
-        guard let base = baseURL, let token = serverToken else { return }
+        guard let ref = currentLibrary, let base = baseURL, let token = serverToken else { return }
         tabLoading = true
         Task {
-            playlists = (try? await api.playlists(base: base, token: token)) ?? []
+            let items = (try? await api.playlists(base: base, token: token)) ?? []
+            // Discard if the user switched libraries while we were loading.
+            guard currentLibrary?.id == ref.id else { return }
+            playlists = items
             tabLoading = false
         }
     }
