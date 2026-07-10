@@ -379,6 +379,71 @@ final class PlexAPI {
                    + params.joined(separator: "&"))
     }
 
+    /// Fires a series of transcode requests with different parameter shapes
+    /// and encodings, logging each result - a one-button experiment to find
+    /// which shape (if any) this server accepts. Results appear in the
+    /// Network Log labeled "probe ...".
+    func runTranscodeProbe(base: URL, token: String, item: PlexMetadata) async {
+        func enc(_ s: String) -> String {
+            s.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? s
+        }
+        func encU(_ s: String) -> String { // RFC 3986 unreserved: -._~ stay literal
+            var allowed = CharacterSet.alphanumerics
+            allowed.insert(charactersIn: "-._~")
+            return s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s
+        }
+        let session = UUID().uuidString
+        let path = "/library/metadata/\(item.ratingKey)"
+
+        var variants: [(String, String)] = []
+        variants.append(("probe v0 (bare endpoint, token only)",
+            "X-Plex-Token=" + encU(token)))
+        variants.append(("probe v1 (original app params)", [
+            "path=" + enc(path), "mediaIndex=0", "partIndex=0", "protocol=hls",
+            "fastSeek=1", "directPlay=0", "directStream=1", "subtitles=burn",
+            "videoQuality=100", "maxVideoBitrate=20000",
+            "X-Plex-Client-Identifier=" + enc(clientID),
+            "X-Plex-Product=" + enc(product),
+            "X-Plex-Platform=" + enc(platform),
+            "X-Plex-Token=" + enc(token),
+        ].joined(separator: "&")))
+        variants.append(("probe v2 (v1 + unreserved encoding)", [
+            "path=" + encU(path), "mediaIndex=0", "partIndex=0", "protocol=hls",
+            "fastSeek=1", "directPlay=0", "directStream=1", "subtitles=burn",
+            "videoQuality=100", "maxVideoBitrate=20000",
+            "session=" + encU(session),
+            "X-Plex-Client-Identifier=" + encU(clientID),
+            "X-Plex-Product=" + encU(product),
+            "X-Plex-Platform=" + encU(platform),
+            "X-Plex-Token=" + encU(token),
+        ].joined(separator: "&")))
+        variants.append(("probe v3 (minimal)", [
+            "path=" + encU(path), "protocol=hls",
+            "X-Plex-Client-Identifier=" + encU(clientID),
+            "X-Plex-Token=" + encU(token),
+        ].joined(separator: "&")))
+
+        for (label, query) in variants {
+            guard let url = URL(string: base.absoluteString
+                                + "/video/:/transcode/universal/start.m3u8?" + query) else { continue }
+            var req = URLRequest(url: url, timeoutInterval: 30)
+            for (k, v) in headers(token: token) { req.setValue(v, forHTTPHeaderField: k) }
+            let start = Date()
+            do {
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                NetworkLog.record(url: url, start: start,
+                                  status: (resp as? HTTPURLResponse)?.statusCode, bytes: data.count,
+                                  detail: String(data: data.prefix(200), encoding: .utf8),
+                                  label: label)
+            } catch {
+                NetworkLog.record(url: url, start: start,
+                                  error: (error as NSError).localizedDescription, label: label)
+            }
+        }
+        // Best-effort cleanup of any session the probes started.
+        await stopTranscode(base: base, token: token, session: session)
+    }
+
     /// Asks the server to explain its transcode decision for the same request
     /// the player is about to make. Purely diagnostic: the structured verdict
     /// (or refusal) lands in the network log.

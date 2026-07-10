@@ -178,6 +178,7 @@ final class PlexPlayerViewModel: ObservableObject {
     private var itemErrorObservation: NSKeyValueObservation?
     private var failedToEndObserver: NSObjectProtocol?
     private var forceTranscodeNext = false
+    private var lastFailedItem: PlexMetadata?
 
     /// Human-readable playback failure, surfaced as an alert.
     @Published var playbackAlert: String?
@@ -394,6 +395,14 @@ final class PlexPlayerViewModel: ObservableObject {
             activeConnectionInfo = describeConnection(base: fresh.base, serverID: serverID)
             saveCachedConnection(serverID: serverID, name: server.name, base: fresh.base, token: fresh.token)
         }
+    }
+
+    /// Fires the transcode probe against the current server using the item
+    /// that last failed (or something from the home screen).
+    func runTranscodeProbe() {
+        guard let base = baseURL, let token = serverToken,
+              let item = lastFailedItem ?? onDeck.first ?? recentlyAdded.first else { return }
+        Task { await api.runTranscodeProbe(base: base, token: token, item: item) }
     }
 
     /// Drops cached connections and re-runs server discovery — useful after
@@ -1033,6 +1042,7 @@ final class PlexPlayerViewModel: ObservableObject {
             let resume = currentTime > 5 ? CMTime(seconds: currentTime, preferredTimescale: 600) : nil
             Task { await startPlayback(item, resumeAt: resume) }
         } else {
+            lastFailedItem = item
             NetworkLog.record(url: url, start: Date(), error: message, label: "AVPlayer FAILED")
             playbackAlert = "Couldn't play \u{201C}\(item.title)\u{201D}: \(message)"
                 + (activeConnectionInfo.map { "\n\nConnection: \($0)" } ?? "")
@@ -2321,6 +2331,7 @@ private struct PlexSettingsView: View {
                            isOn: Binding(get: { prefs.showNetworkDebug },
                                          set: { prefs.setShowNetworkDebug($0) }))
                     Button("Network Log\u{2026}") { showNetworkLog = true }
+                    Button("Run Transcode Probe") { model.runTranscodeProbe() }
                 }
 
                 Section {
