@@ -410,13 +410,19 @@ final class PlexPlayerViewModel: ObservableObject {
 
     func selectHome() {
         showLibraryPicker = false
-        Task { await loadHome() }
+        Task {
+            await Task.yield() // let the sheet-dismiss view update finish first
+            await loadHome()
+        }
     }
 
     func select(library ref: PlexLibraryRef) {
         showLibraryPicker = false
         homeEpoch += 1 // invalidate any in-flight home load for the old server
         Task {
+            // Hop past the sheet-dismiss view update; publishing changes while
+            // that update is in flight is undefined behavior.
+            await Task.yield()
             phase = .loading("Loading \(ref.title)…")
             guard let conn = await connection(for: ref.serverID) else {
                 phase = .error("Couldn't reach \(ref.serverName).")
