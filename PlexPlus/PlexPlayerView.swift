@@ -283,7 +283,7 @@ final class PlexPlayerViewModel: ObservableObject {
 
         phase = .loading("Finding your servers…")
         do {
-            let all = try await api.resources(token: token).filter { $0.isServer }
+            let all = dedupedServers(try await api.resources(token: token))
             servers = all
             guard let first = all.first else {
                 phase = .error("No Plex servers found on this account.")
@@ -298,11 +298,20 @@ final class PlexPlayerViewModel: ObservableObject {
     /// Refresh the server list without disturbing the active connection.
     private func refreshServers(preferredID: String?) async {
         guard let token = authToken,
-              let all = try? await api.resources(token: token).filter({ $0.isServer }) else { return }
+              let resources = try? await api.resources(token: token) else { return }
+        let all = dedupedServers(resources)
         servers = all
         if selectedServer == nil, let preferredID {
             selectedServer = all.first { $0.clientIdentifier == preferredID }
         }
+    }
+
+    /// plex.tv can list the same server more than once (e.g. owned + shared
+    /// access). Duplicate clientIdentifiers break SwiftUI's ForEach identity,
+    /// so keep only the first entry per server.
+    private func dedupedServers(_ resources: [PlexResource]) -> [PlexResource] {
+        var seen = Set<String>()
+        return resources.filter { $0.isServer && seen.insert($0.clientIdentifier).inserted }
     }
 
     private func loadCachedConnection() -> PlexCachedConnection? {
@@ -1698,20 +1707,22 @@ private struct LibraryPickerView: View {
                     .buttonStyle(.plain)
                 }
 
-                // One Section per server so SwiftUI keeps each server's rows
-                // distinctly identified (otherwise async loads get mismatched).
+                // One Section per server, and rows identified by the
+                // server-qualified ref id (serverID:sectionKey). Plain section
+                // keys ("1", "2", ...) collide across servers, which made
+                // SwiftUI mismatch row content between servers.
                 if showAll {
                     ForEach(model.servers) { server in
                         Section {
-                            let libs = model.serverLibraries[server.clientIdentifier] ?? []
-                            if libs.isEmpty {
+                            let refs = (model.serverLibraries[server.clientIdentifier] ?? [])
+                                .map { model.makeRef(server: server, section: $0) }
+                            if refs.isEmpty {
                                 HStack(spacing: 6) {
                                     ProgressView().controlSize(.small)
                                     Text("Loading…").foregroundStyle(.secondary)
                                 }
                             } else {
-                                ForEach(libs) { section in
-                                    let ref = model.makeRef(server: server, section: section)
+                                ForEach(refs) { ref in
                                     LibraryRow(ref: ref, isFavorite: prefs.isFavorite(ref),
                                                onSelect: { model.select(library: ref) },
                                                onToggleFavorite: { prefs.toggleFavorite(ref) })
