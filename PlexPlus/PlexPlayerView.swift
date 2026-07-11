@@ -761,6 +761,61 @@ final class PlexPlayerViewModel: ObservableObject {
         }
     }
 
+    /// Re-runs the current search on another server: switches the active
+    /// connection, reloads that server's libraries, and searches all of them.
+    func searchOnServer(_ server: PlexResource) {
+        guard server.clientIdentifier != selectedServer?.clientIdentifier else { return }
+        homeEpoch += 1 // invalidate in-flight home loads for the old server
+        Task {
+            guard let conn = await connection(for: server.clientIdentifier) else {
+                playlistSaveStatus = "Couldn't reach \(server.name)."
+                return
+            }
+            baseURL = conn.base
+            serverToken = conn.token
+            selectedServer = server
+            activeConnectionInfo = describeConnection(base: conn.base, serverID: server.clientIdentifier)
+            saveCachedConnection(serverID: server.clientIdentifier, name: server.name,
+                                 base: conn.base, token: conn.token)
+            // Leave any old library context behind; post-search we land on
+            // this server's Home.
+            mode = .home
+            stack = []
+            searchScope = .all
+            searchSections = []
+            searchResults = []
+            if let cached = serverLibraries[server.clientIdentifier] {
+                searchScopeOptions = cached
+            } else if let secs = try? await api.sections(base: conn.base, token: conn.token) {
+                serverLibraries[server.clientIdentifier] = secs
+                searchScopeOptions = secs
+            } else {
+                searchScopeOptions = []
+            }
+            scheduleSearch()
+            // Refresh home rows in the background so nothing stale from the
+            // previous server shows when the search is cleared.
+            Task { await refreshHomeData(base: conn.base, token: conn.token) }
+        }
+    }
+
+    /// Reloads On Deck / Recently Added / Libraries for the current server
+    /// without touching phase or mode (silent, for server switches mid-search).
+    private func refreshHomeData(base: URL, token: String) async {
+        homeEpoch += 1
+        let epoch = homeEpoch
+        async let deck = try? api.onDeck(base: base, token: token)
+        async let recent = try? api.recentlyAdded(base: base, token: token)
+        async let secs = try? api.sections(base: base, token: token)
+        let newDeck = await deck ?? []
+        let newRecent = await recent ?? []
+        let newSections = await secs ?? []
+        guard epoch == homeEpoch else { return }
+        onDeck = newDeck
+        recentlyAdded = newRecent
+        sections = newSections
+    }
+
     /// Creates server-side playlist(s) from the current search results.
     /// Searching all libraries saves one playlist per library with results.
     func saveSearchResultsToPlaylist() {
@@ -1698,6 +1753,23 @@ private struct UniversalSearchResults: View {
                     Text("\(model.searchResults.count) result\(model.searchResults.count == 1 ? "" : "s") \u{2014} \(model.searchScopeTitle)")
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
+                    if model.servers.count > 1 {
+                        Menu {
+                            ForEach(model.servers.filter { $0.clientIdentifier != model.selectedServer?.clientIdentifier }) { server in
+                                Button("Search \(server.name)") { model.searchOnServer(server) }
+                            }
+                        } label: {
+                            HStack(spacing: 3) {
+                                Image(systemName: "server.rack")
+                                Text(model.selectedServer?.name ?? "Server")
+                                Image(systemName: "chevron.down").font(.caption2)
+                            }
+                            .font(.caption)
+                        }
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                        .help("Run this search on another server")
+                    }
                     Button("Save to Playlist\u{2026}") {
                         model.saveSearchPlaylistName = model.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
                         model.showSaveSearchPlaylist = true
