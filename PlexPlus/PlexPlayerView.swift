@@ -765,17 +765,17 @@ final class PlexPlayerViewModel: ObservableObject {
 
     func setSearchScope(_ scope: SearchScope) {
         searchScope = scope
-        scheduleSearch()
+        scheduleSearch(immediate: true)
     }
 
     func setSearchSortField(_ field: PlexSortField) {
         searchSortField = field
-        scheduleSearch()
+        scheduleSearch(immediate: true)
     }
 
     func setSearchSortAscending(_ ascending: Bool) {
         searchSortAscending = ascending
-        scheduleSearch()
+        scheduleSearch(immediate: true)
     }
 
     func setSearchScope(tag: String) {
@@ -820,7 +820,7 @@ final class PlexPlayerViewModel: ObservableObject {
             } else {
                 searchScopeOptions = []
             }
-            scheduleSearch()
+            scheduleSearch(immediate: true)
             // Refresh home rows in the background so nothing stale from the
             // previous server shows when the search is cleared.
             Task { await refreshHomeData(base: conn.base, token: conn.token) }
@@ -881,7 +881,7 @@ final class PlexPlayerViewModel: ObservableObject {
 
     /// Debounced; all state changes happen inside the Task so they never fire
     /// during the text field's view update.
-    private func scheduleSearch() {
+    private func scheduleSearch(immediate: Bool = false) {
         searchTask?.cancel()
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         searchTask = Task {
@@ -894,7 +894,10 @@ final class PlexPlayerViewModel: ObservableObject {
             }
             searchActive = true
             searching = true
-            try? await Task.sleep(nanoseconds: 300_000_000)
+            if !immediate {
+                // Debounce keystrokes; sort/scope/server changes run at once.
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
             if Task.isCancelled { return }
             guard let base = baseURL, let token = serverToken else {
                 searching = false
@@ -1786,6 +1789,9 @@ private struct UniversalSearchResults: View {
                 HStack {
                     Text("\(model.searchResults.count) result\(model.searchResults.count == 1 ? "" : "s") \u{2014} \(model.searchScopeTitle)")
                         .font(.caption).foregroundStyle(.secondary)
+                    if model.searching {
+                        ProgressView().controlSize(.small).padding(.leading, 2)
+                    }
                     Spacer()
                     Menu {
                         Picker("Sort by", selection: Binding(get: { model.searchSortField },
@@ -1852,6 +1858,8 @@ private struct UniversalSearchResults: View {
                         .padding()
                     }
                 }
+                .opacity(model.searching ? 0.45 : 1.0)
+                .animation(.easeInOut(duration: 0.15), value: model.searching)
             }
         }
     }
