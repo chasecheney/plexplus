@@ -131,10 +131,43 @@ final class PlexPlayerViewModel: ObservableObject {
     @Published private(set) var searchActive = false
     @Published private(set) var searching = false
     private var searchTask: Task<Void, Never>?
-    /// Library to search; nil = the library being browsed.
-    @Published private(set) var searchScope: PlexDirectory?
+    enum SearchScope: Equatable {
+        case current               // the library being browsed (Home searches all)
+        case all                   // every library on this server
+        case one(PlexDirectory)    // a specific library
+    }
+    struct SearchSection: Identifiable {
+        let library: PlexDirectory
+        var items: [PlexMetadata]
+        var id: String { library.key }
+    }
+    @Published private(set) var searchScope: SearchScope = .current
+    /// Per-library groups when searching all libraries.
+    @Published private(set) var searchSections: [SearchSection] = []
     /// This server's libraries, for the search-scope menu.
     @Published private(set) var searchScopeOptions: [PlexDirectory] = []
+
+    /// `.current` resolves to `.all` when no library is being browsed (Home).
+    var effectiveSearchScope: SearchScope {
+        if case .current = searchScope, currentLibrary == nil { return .all }
+        return searchScope
+    }
+
+    var searchScopeTitle: String {
+        switch effectiveSearchScope {
+        case .current: return "This library"
+        case .all: return "All libraries"
+        case .one(let dir): return dir.title
+        }
+    }
+
+    var searchScopeTag: String {
+        switch effectiveSearchScope {
+        case .current: return "current"
+        case .all: return "all"
+        case .one(let dir): return "lib:" + dir.key
+        }
+    }
 
     // Save-search-to-playlist flow
     @Published var showSaveSearchPlaylist = false
@@ -464,6 +497,7 @@ final class PlexPlayerViewModel: ObservableObject {
         onDeck = newDeck
         recentlyAdded = newRecent
         sections = newSections
+        searchScopeOptions = newSections
         phase = .browsing
     }
 
@@ -513,7 +547,7 @@ final class PlexPlayerViewModel: ObservableObject {
             mode = .library(ref)
             stack = []
             searchText = ""
-            searchScope = nil
+            searchScope = .current
             // Options for the search-scope menu (this server's libraries).
             if let cached = serverLibraries[ref.serverID] {
                 searchScopeOptions = cached
@@ -706,30 +740,58 @@ final class PlexPlayerViewModel: ObservableObject {
 
     // MARK: Search
 
-    /// Items to show in Browse: search results when a search is active.
-    var displayedBrowseItems: [PlexMetadata] { searchActive ? searchResults : browseItems }
+    /// Items to show in Browse. (Search now lives above the library UI.)
+    var displayedBrowseItems: [PlexMetadata] { browseItems }
 
     func clearSearch() { searchText = "" }
 
-    func setSearchScope(_ scope: PlexDirectory?) {
+    func setSearchScope(_ scope: SearchScope) {
         searchScope = scope
         scheduleSearch()
     }
 
-    /// Creates a server-side playlist from the current search results.
+    func setSearchScope(tag: String) {
+        switch tag {
+        case "current": setSearchScope(.current)
+        case "all": setSearchScope(.all)
+        default:
+            if let dir = searchScopeOptions.first(where: { "lib:" + $0.key == tag }) {
+                setSearchScope(.one(dir))
+            }
+        }
+    }
+
+    /// Creates server-side playlist(s) from the current search results.
+    /// Searching all libraries saves one playlist per library with results.
     func saveSearchResultsToPlaylist() {
-        let items = searchResults
         let name = saveSearchPlaylistName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !items.isEmpty, !name.isEmpty,
-              let base = baseURL, let token = serverToken,
+        guard !name.isEmpty, let base = baseURL, let token = serverToken,
               let machineID = currentLibrary?.serverID ?? selectedServer?.clientIdentifier else { return }
+        let toSave: [(title: String, items: [PlexMetadata])]
+        if case .all = effectiveSearchScope, !searchSections.isEmpty {
+            toSave = searchSections.map { ("\(name) \u{2014} \($0.library.title)", $0.items) }
+        } else {
+            toSave = searchResults.isEmpty ? [] : [(name, searchResults)]
+        }
+        guard !toSave.isEmpty else { return }
         Task {
-            do {
-                try await api.createPlaylist(base: base, token: token, machineID: machineID,
-                                             title: name, ratingKeys: items.map(\.ratingKey))
-                playlistSaveStatus = "Saved \(items.count) item\(items.count == 1 ? "" : "s") to \u{201C}\(name)\u{201D}."
-            } catch {
-                playlistSaveStatus = "Couldn't create playlist: \(classify(error))"
+            var created = 0
+            var failed: [String] = []
+            for entry in toSave {
+                do {
+                    try await api.createPlaylist(base: base, token: token, machineID: machineID,
+                                                 title: entry.title, ratingKeys: entry.items.map(\.ratingKey))
+                    created += 1
+                } catch {
+                    failed.append(entry.title)
+                }
+            }
+            if failed.isEmpty {
+                playlistSaveStatus = created == 1
+                    ? "Saved \(toSave[0].items.count) item\(toSave[0].items.count == 1 ? "" : "s") to \u{201C}\(toSave[0].title)\u{201D}."
+                    : "Saved \(created) playlists, one per library."
+            } else {
+                playlistSaveStatus = "Created \(created) of \(toSave.count) playlists. Failed: \(failed.joined(separator: ", "))."
             }
         }
     }
@@ -744,24 +806,61 @@ final class PlexPlayerViewModel: ObservableObject {
                 searchActive = false
                 searching = false
                 searchResults = []
+                searchSections = []
                 return
             }
             searchActive = true
             searching = true
             try? await Task.sleep(nanoseconds: 300_000_000)
             if Task.isCancelled { return }
-            guard let ref = currentLibrary, let base = baseURL, let token = serverToken else {
+            guard let base = baseURL, let token = serverToken else {
                 searching = false
                 return
             }
-            let scopeKey = searchScope?.key ?? ref.sectionKey
-            let scopeType = searchScope?.type ?? ref.type
-            let type: Int? = scopeType == "show" ? (searchScope == nil && tvEpisodes ? 4 : 2) : nil
-            let results = (try? await api.searchLibrary(base: base, token: token,
-                                                        sectionKey: scopeKey,
-                                                        type: type, query: query)) ?? []
-            if Task.isCancelled { return }
-            searchResults = results
+            let api = self.api
+            switch effectiveSearchScope {
+            case .all:
+                let libs = searchScopeOptions.isEmpty ? sections : searchScopeOptions
+                var found: [SearchSection] = []
+                await withTaskGroup(of: SearchSection?.self) { group in
+                    for lib in libs {
+                        group.addTask {
+                            let type: Int? = lib.type == "show" ? 2 : nil
+                            let items = (try? await api.searchLibrary(base: base, token: token,
+                                                                      sectionKey: lib.key,
+                                                                      type: type, query: query)) ?? []
+                            return items.isEmpty ? nil : SearchSection(library: lib, items: items)
+                        }
+                    }
+                    for await section in group { if let section { found.append(section) } }
+                }
+                if Task.isCancelled { return }
+                searchSections = found.sorted {
+                    $0.library.title.localizedCaseInsensitiveCompare($1.library.title) == .orderedAscending
+                }
+                searchResults = searchSections.flatMap(\.items)
+            case .current, .one:
+                var sectionKey: String?
+                var libType: String?
+                if case .one(let dir) = effectiveSearchScope {
+                    sectionKey = dir.key
+                    libType = dir.type
+                } else if let ref = currentLibrary {
+                    sectionKey = ref.sectionKey
+                    libType = ref.type
+                }
+                guard let key = sectionKey else { searching = false; return }
+                var type: Int?
+                if libType == "show" {
+                    if case .current = effectiveSearchScope { type = tvEpisodes ? 4 : 2 } else { type = 2 }
+                }
+                let results = (try? await api.searchLibrary(base: base, token: token,
+                                                            sectionKey: key,
+                                                            type: type, query: query)) ?? []
+                if Task.isCancelled { return }
+                searchSections = []
+                searchResults = results
+            }
             searching = false
         }
     }
@@ -1464,7 +1563,10 @@ private struct BrowseView: View {
         VStack(spacing: 0) {
             toolbar
             Divider()
-            if let level = model.stack.last {
+            UniversalSearchBar(model: model)
+            if model.searchActive {
+                UniversalSearchResults(model: model)
+            } else if let level = model.stack.last {
                 DrillView(model: model, level: level)
             } else if case .library = model.mode {
                 LibraryRootView(model: model)
@@ -1508,6 +1610,128 @@ private struct BrowseView: View {
         .padding(.leading, 12).padding(.vertical, 8)
         .padding(.trailing, 12)
         .background(.bar)
+    }
+}
+
+// MARK: - Universal search
+
+private struct UniversalSearchBar: View {
+    @ObservedObject var model: PlexPlayerViewModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            TextField("Search by title", text: $model.searchText)
+                .textFieldStyle(.plain)
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                #endif
+
+            // Scope: current library, all libraries, or a specific one.
+            Menu {
+                Picker("Search in", selection: Binding(
+                    get: { model.searchScopeTag },
+                    set: { model.setSearchScope(tag: $0) })) {
+                    if model.currentLibrary != nil {
+                        Text("This library").tag("current")
+                    }
+                    Text("All libraries").tag("all")
+                    Divider()
+                    ForEach(model.searchScopeOptions) { section in
+                        Label(section.title, systemImage: section.symbolName).tag("lib:" + section.key)
+                    }
+                }
+            } label: {
+                HStack(spacing: 3) {
+                    Text(model.searchScopeTitle)
+                    Image(systemName: "chevron.down").font(.caption2)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            .menuIndicator(.hidden)
+            .fixedSize()
+
+            if !model.searchText.isEmpty {
+                Button { model.clearSearch() } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(Palette.selectedControl, in: RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .alert("Save to Playlist", isPresented: $model.showSaveSearchPlaylist) {
+            TextField("Playlist name", text: $model.saveSearchPlaylistName)
+            Button("Save") { model.saveSearchResultsToPlaylist() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            if model.searchSections.count > 1 {
+                Text("Creates \(model.searchSections.count) playlists \u{2014} one per library with results, named \u{201C}name \u{2014} library\u{201D}.")
+            } else {
+                Text("Creates a playlist on the server from the \(model.searchResults.count) search results.")
+            }
+        }
+        .alert("Playlist", isPresented: Binding(get: { model.playlistSaveStatus != nil },
+                                                set: { if !$0 { model.playlistSaveStatus = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(model.playlistSaveStatus ?? "")
+        }
+    }
+}
+
+private struct UniversalSearchResults: View {
+    @ObservedObject var model: PlexPlayerViewModel
+    private let columns = [GridItem(.adaptive(minimum: 140), spacing: 16)]
+
+    var body: some View {
+        if model.searching && model.searchResults.isEmpty {
+            LoadingBanner(text: "Searching\u{2026}")
+        } else if model.searchResults.isEmpty {
+            EmptyBanner(text: "No results for \u{201C}\(model.searchText)\u{201D}.")
+        } else {
+            VStack(spacing: 0) {
+                HStack {
+                    Text("\(model.searchResults.count) result\(model.searchResults.count == 1 ? "" : "s") \u{2014} \(model.searchScopeTitle)")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Save to Playlist\u{2026}") {
+                        model.saveSearchPlaylistName = model.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        model.showSaveSearchPlaylist = true
+                    }
+                    .font(.caption)
+                }
+                .padding(.horizontal, 14).padding(.vertical, 6)
+                ScrollView {
+                    if model.searchSections.isEmpty {
+                        grid(model.searchResults).padding()
+                    } else {
+                        VStack(alignment: .leading, spacing: 20) {
+                            ForEach(model.searchSections) { section in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Label("\(section.library.title)  (\(section.items.count))",
+                                          systemImage: section.library.symbolName)
+                                        .font(.headline)
+                                    grid(section.items)
+                                }
+                            }
+                        }
+                        .padding()
+                    }
+                }
+            }
+        }
+    }
+
+    private func grid(_ items: [PlexMetadata]) -> some View {
+        LazyVGrid(columns: columns, spacing: 16) {
+            ForEach(items) { item in
+                PosterCard(model: model, item: item) { model.open(item: item) }
+            }
+        }
     }
 }
 
@@ -1600,104 +1824,12 @@ private struct BrowseTab: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            searchBar
             controls
             Divider()
             ZStack(alignment: .bottom) {
-                if model.searchActive { searchContent } else { loadStateContent }
+                loadStateContent
                 if prefs.showNetworkDebug {
                     NetDebugBar(stat: model.browseNet).padding(8)
-                }
-            }
-            .alert("Save to Playlist", isPresented: $model.showSaveSearchPlaylist) {
-                TextField("Playlist name", text: $model.saveSearchPlaylistName)
-                Button("Save") { model.saveSearchResultsToPlaylist() }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("Creates a playlist on the server from the \(model.searchResults.count) search results.")
-            }
-            .alert("Playlist", isPresented: Binding(get: { model.playlistSaveStatus != nil },
-                                                    set: { if !$0 { model.playlistSaveStatus = nil } })) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(model.playlistSaveStatus ?? "")
-            }
-        }
-    }
-
-    private var searchBar: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-            TextField("Search by title", text: $model.searchText)
-                .textFieldStyle(.plain)
-                #if os(iOS)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                #endif
-
-            // Scope: this library, or another library on the same server.
-            Menu {
-                Picker("Search in", selection: Binding(
-                    get: { model.searchScope?.key ?? "" },
-                    set: { key in
-                        model.setSearchScope(model.searchScopeOptions.first {
-                            $0.key == key && $0.key != model.currentLibrary?.sectionKey
-                        })
-                    })) {
-                    Text("This library").tag("")
-                    ForEach(model.searchScopeOptions.filter { $0.key != model.currentLibrary?.sectionKey }) { section in
-                        Label(section.title, systemImage: section.symbolName).tag(section.key)
-                    }
-                }
-            } label: {
-                HStack(spacing: 3) {
-                    Text(model.searchScope?.title ?? "This library")
-                    Image(systemName: "chevron.down").font(.caption2)
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-            .menuIndicator(.hidden)
-            .fixedSize()
-            if !model.searchText.isEmpty {
-                Button { model.clearSearch() } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                }
-                .buttonStyle(.borderless)
-            }
-        }
-        .padding(.horizontal, 10).padding(.vertical, 6)
-        .background(Palette.selectedControl, in: RoundedRectangle(cornerRadius: 8))
-        .padding(.horizontal, 12).padding(.top, 8)
-    }
-
-    @ViewBuilder
-    private var searchContent: some View {
-        if model.searching && model.searchResults.isEmpty {
-            LoadingBanner(text: "Searching…")
-        } else if model.searchResults.isEmpty {
-            EmptyBanner(text: "No results for “\(model.searchText)”.")
-        } else {
-            VStack(spacing: 0) {
-                HStack {
-                    Text("\(model.searchResults.count) result\(model.searchResults.count == 1 ? "" : "s")"
-                         + (model.searchScope.map { " in \u{201C}\($0.title)\u{201D}" } ?? ""))
-                        .font(.caption).foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Save to Playlist\u{2026}") {
-                        model.saveSearchPlaylistName = model.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        model.showSaveSearchPlaylist = true
-                    }
-                    .font(.caption)
-                }
-                .padding(.horizontal, 14).padding(.vertical, 6)
-                ScrollView {
-                    LazyVGrid(columns: columns, spacing: 16) {
-                        ForEach(model.searchResults) { item in
-                            PosterCard(model: model, item: item) { model.open(item: item) }
-                        }
-                    }
-                    .padding()
                 }
             }
         }

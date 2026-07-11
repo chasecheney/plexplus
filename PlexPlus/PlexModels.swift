@@ -68,7 +68,7 @@ struct PlexHub: Decodable, Identifiable {
 }
 
 /// A library section (e.g. "Movies", "TV Shows").
-struct PlexDirectory: Decodable, Identifiable {
+struct PlexDirectory: Decodable, Identifiable, Equatable {
     let key: String
     let title: String
     let type: String?
