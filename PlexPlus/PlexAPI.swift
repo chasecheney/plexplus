@@ -210,13 +210,14 @@ final class PlexAPI {
     /// libraries since the server does the matching). Plex's free-text search
     /// has no boolean operators, so this is a substring title match.
     func searchLibrary(base: URL, token: String, sectionKey: String,
-                       type: Int?, query: String,
+                       type: Int?, query: String, sort: String? = nil,
                        onResponse: @escaping (Int) -> Void = { _ in },
                        onProgress: @escaping (Int) -> Void = { _ in }) async throws -> [PlexMetadata] {
         // .alphanumerics so "&" and "=" in the query are escaped (urlQueryAllowed leaves them raw).
         func enc(_ s: String) -> String { s.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? s }
         var params = ["title=" + enc(query), "X-Plex-Container-Start=0", "X-Plex-Container-Size=200"]
         if let type { params.append("type=\(type)") }
+        if let sort, !sort.isEmpty { params.append("sort=" + sort) }
         let path = "/library/sections/\(sectionKey)/all?" + params.joined(separator: "&")
         return try await fetchMetadataList(path: path, base: base, token: token,
                                            onResponse: onResponse, onProgress: onProgress)

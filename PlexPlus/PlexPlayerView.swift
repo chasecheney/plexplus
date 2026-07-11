@@ -146,6 +146,13 @@ final class PlexPlayerViewModel: ObservableObject {
     @Published private(set) var searchSections: [SearchSection] = []
     /// This server's libraries, for the search-scope menu.
     @Published private(set) var searchScopeOptions: [PlexDirectory] = []
+    /// Sort applied to search results (server-side).
+    @Published private(set) var searchSortField: PlexSortField = .name
+    @Published private(set) var searchSortAscending = true
+
+    var searchSortString: String {
+        searchSortField.key + (searchSortAscending ? ":asc" : ":desc")
+    }
 
     /// `.current` resolves to `.all` when no library is being browsed (Home).
     var effectiveSearchScope: SearchScope {
@@ -761,6 +768,16 @@ final class PlexPlayerViewModel: ObservableObject {
         scheduleSearch()
     }
 
+    func setSearchSortField(_ field: PlexSortField) {
+        searchSortField = field
+        scheduleSearch()
+    }
+
+    func setSearchSortAscending(_ ascending: Bool) {
+        searchSortAscending = ascending
+        scheduleSearch()
+    }
+
     func setSearchScope(tag: String) {
         switch tag {
         case "current": setSearchScope(.current)
@@ -890,11 +907,13 @@ final class PlexPlayerViewModel: ObservableObject {
                 var found: [SearchSection] = []
                 await withTaskGroup(of: SearchSection?.self) { group in
                     for lib in libs {
+                        let sort = searchSortString
                         group.addTask {
                             let type: Int? = lib.type == "show" ? 2 : nil
                             let items = (try? await api.searchLibrary(base: base, token: token,
                                                                       sectionKey: lib.key,
-                                                                      type: type, query: query)) ?? []
+                                                                      type: type, query: query,
+                                                                      sort: sort)) ?? []
                             return items.isEmpty ? nil : SearchSection(library: lib, items: items)
                         }
                     }
@@ -922,7 +941,8 @@ final class PlexPlayerViewModel: ObservableObject {
                 }
                 let results = (try? await api.searchLibrary(base: base, token: token,
                                                             sectionKey: key,
-                                                            type: type, query: query)) ?? []
+                                                            type: type, query: query,
+                                                            sort: searchSortString)) ?? []
                 if Task.isCancelled { return }
                 searchSections = []
                 searchResults = results
@@ -1767,6 +1787,30 @@ private struct UniversalSearchResults: View {
                     Text("\(model.searchResults.count) result\(model.searchResults.count == 1 ? "" : "s") \u{2014} \(model.searchScopeTitle)")
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
+                    Menu {
+                        Picker("Sort by", selection: Binding(get: { model.searchSortField },
+                                                             set: { model.setSearchSortField($0) })) {
+                            ForEach(PlexSortField.allCases) { field in Text(field.rawValue).tag(field) }
+                        }
+                        .pickerStyle(.inline)
+                        Divider()
+                        Picker("Order", selection: Binding(get: { model.searchSortAscending },
+                                                           set: { model.setSearchSortAscending($0) })) {
+                            Text("Ascending").tag(true)
+                            Text("Descending").tag(false)
+                        }
+                        .pickerStyle(.inline)
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.up.arrow.down")
+                            Text(model.searchSortField.rawValue)
+                        }
+                        .font(.caption)
+                    }
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("Sort search results")
+
                     if model.servers.count > 1 {
                         Menu {
                             ForEach(model.servers.filter { $0.clientIdentifier != model.selectedServer?.clientIdentifier }) { server in
