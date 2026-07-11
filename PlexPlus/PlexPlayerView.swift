@@ -131,6 +131,15 @@ final class PlexPlayerViewModel: ObservableObject {
     @Published private(set) var searchActive = false
     @Published private(set) var searching = false
     private var searchTask: Task<Void, Never>?
+    /// Library to search; nil = the library being browsed.
+    @Published private(set) var searchScope: PlexDirectory?
+    /// This server's libraries, for the search-scope menu.
+    @Published private(set) var searchScopeOptions: [PlexDirectory] = []
+
+    // Save-search-to-playlist flow
+    @Published var showSaveSearchPlaylist = false
+    @Published var saveSearchPlaylistName = ""
+    @Published var playlistSaveStatus: String?
 
     // Player
     @Published var player: AVPlayer?
@@ -504,6 +513,19 @@ final class PlexPlayerViewModel: ObservableObject {
             mode = .library(ref)
             stack = []
             searchText = ""
+            searchScope = nil
+            // Options for the search-scope menu (this server's libraries).
+            if let cached = serverLibraries[ref.serverID] {
+                searchScopeOptions = cached
+            } else {
+                searchScopeOptions = []
+                Task {
+                    if let secs = try? await api.sections(base: conn.base, token: conn.token) {
+                        serverLibraries[ref.serverID] = secs
+                        searchScopeOptions = secs
+                    }
+                }
+            }
             // Restore the remembered sort field and its remembered/default direction.
             sortField = prefs.sortField
             sortAscending = prefs.ascending(for: sortField)
@@ -689,6 +711,29 @@ final class PlexPlayerViewModel: ObservableObject {
 
     func clearSearch() { searchText = "" }
 
+    func setSearchScope(_ scope: PlexDirectory?) {
+        searchScope = scope
+        scheduleSearch()
+    }
+
+    /// Creates a server-side playlist from the current search results.
+    func saveSearchResultsToPlaylist() {
+        let items = searchResults
+        let name = saveSearchPlaylistName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !items.isEmpty, !name.isEmpty,
+              let base = baseURL, let token = serverToken,
+              let machineID = currentLibrary?.serverID ?? selectedServer?.clientIdentifier else { return }
+        Task {
+            do {
+                try await api.createPlaylist(base: base, token: token, machineID: machineID,
+                                             title: name, ratingKeys: items.map(\.ratingKey))
+                playlistSaveStatus = "Saved \(items.count) item\(items.count == 1 ? "" : "s") to \u{201C}\(name)\u{201D}."
+            } catch {
+                playlistSaveStatus = "Couldn't create playlist: \(classify(error))"
+            }
+        }
+    }
+
     /// Debounced; all state changes happen inside the Task so they never fire
     /// during the text field's view update.
     private func scheduleSearch() {
@@ -709,9 +754,11 @@ final class PlexPlayerViewModel: ObservableObject {
                 searching = false
                 return
             }
-            let type: Int? = ref.type == "show" ? (tvEpisodes ? 4 : 2) : nil
+            let scopeKey = searchScope?.key ?? ref.sectionKey
+            let scopeType = searchScope?.type ?? ref.type
+            let type: Int? = scopeType == "show" ? (searchScope == nil && tvEpisodes ? 4 : 2) : nil
             let results = (try? await api.searchLibrary(base: base, token: token,
-                                                        sectionKey: ref.sectionKey,
+                                                        sectionKey: scopeKey,
                                                         type: type, query: query)) ?? []
             if Task.isCancelled { return }
             searchResults = results
@@ -1562,18 +1609,56 @@ private struct BrowseTab: View {
                     NetDebugBar(stat: model.browseNet).padding(8)
                 }
             }
+            .alert("Save to Playlist", isPresented: $model.showSaveSearchPlaylist) {
+                TextField("Playlist name", text: $model.saveSearchPlaylistName)
+                Button("Save") { model.saveSearchResultsToPlaylist() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Creates a playlist on the server from the \(model.searchResults.count) search results.")
+            }
+            .alert("Playlist", isPresented: Binding(get: { model.playlistSaveStatus != nil },
+                                                    set: { if !$0 { model.playlistSaveStatus = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(model.playlistSaveStatus ?? "")
+            }
         }
     }
 
     private var searchBar: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-            TextField("Search this library by title", text: $model.searchText)
+            TextField("Search by title", text: $model.searchText)
                 .textFieldStyle(.plain)
                 #if os(iOS)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 #endif
+
+            // Scope: this library, or another library on the same server.
+            Menu {
+                Picker("Search in", selection: Binding(
+                    get: { model.searchScope?.key ?? "" },
+                    set: { key in
+                        model.setSearchScope(model.searchScopeOptions.first {
+                            $0.key == key && $0.key != model.currentLibrary?.sectionKey
+                        })
+                    })) {
+                    Text("This library").tag("")
+                    ForEach(model.searchScopeOptions.filter { $0.key != model.currentLibrary?.sectionKey }) { section in
+                        Label(section.title, systemImage: section.symbolName).tag(section.key)
+                    }
+                }
+            } label: {
+                HStack(spacing: 3) {
+                    Text(model.searchScope?.title ?? "This library")
+                    Image(systemName: "chevron.down").font(.caption2)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            .menuIndicator(.hidden)
+            .fixedSize()
             if !model.searchText.isEmpty {
                 Button { model.clearSearch() } label: {
                     Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
@@ -1593,13 +1678,27 @@ private struct BrowseTab: View {
         } else if model.searchResults.isEmpty {
             EmptyBanner(text: "No results for “\(model.searchText)”.")
         } else {
-            ScrollView {
-                LazyVGrid(columns: columns, spacing: 16) {
-                    ForEach(model.searchResults) { item in
-                        PosterCard(model: model, item: item) { model.open(item: item) }
+            VStack(spacing: 0) {
+                HStack {
+                    Text("\(model.searchResults.count) result\(model.searchResults.count == 1 ? "" : "s")"
+                         + (model.searchScope.map { " in \u{201C}\($0.title)\u{201D}" } ?? ""))
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Save to Playlist\u{2026}") {
+                        model.saveSearchPlaylistName = model.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        model.showSaveSearchPlaylist = true
                     }
+                    .font(.caption)
                 }
-                .padding()
+                .padding(.horizontal, 14).padding(.vertical, 6)
+                ScrollView {
+                    LazyVGrid(columns: columns, spacing: 16) {
+                        ForEach(model.searchResults) { item in
+                            PosterCard(model: model, item: item) { model.open(item: item) }
+                        }
+                    }
+                    .padding()
+                }
             }
         }
     }

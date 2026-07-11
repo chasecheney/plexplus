@@ -477,6 +477,20 @@ final class PlexAPI {
         await stopTranscode(base: base, token: token, session: session)
     }
 
+    // MARK: Playlists (write)
+
+    /// Creates a regular (non-smart) playlist on the server from the given items.
+    func createPlaylist(base: URL, token: String, machineID: String,
+                        title: String, type: String = "video",
+                        ratingKeys: [String]) async throws {
+        func enc(_ s: String) -> String { s.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? s }
+        let uri = "server://\(machineID)/com.plexapp.plugins.library/library/metadata/"
+            + ratingKeys.joined(separator: ",")
+        let url = URL(string: base.absoluteString + "/playlists?type=\(type)&smart=0"
+                      + "&title=" + enc(title) + "&uri=" + enc(uri))!
+        _ = try await request(url, method: "POST", token: token)
+    }
+
     /// Asks the server to explain its transcode decision for the same request
     /// the player is about to make. Purely diagnostic: the structured verdict
     /// (or refusal) lands in the network log.
