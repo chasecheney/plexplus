@@ -179,6 +179,8 @@ final class PlexPlayerViewModel: ObservableObject {
     @Published private(set) var nowPlayingTitle: String?
     @Published private(set) var nowPlayingItem: PlexMetadata?
     @Published var isPlayerMinimized = false
+    /// Photo being viewed in the photo sheet (photos never go to AVPlayer).
+    @Published var photoItem: PlexMetadata?
     @Published private(set) var isPlaying = false
     @Published private(set) var currentTime: Double = 0
     @Published private(set) var duration: Double = 0
@@ -573,6 +575,15 @@ final class PlexPlayerViewModel: ObservableObject {
         }
     }
 
+    /// Full-size URL for a photo item (falls back to its thumb).
+    func photoURL(for item: PlexMetadata) -> URL? {
+        guard let base = baseURL, let token = serverToken else { return nil }
+        if let partKey = item.partKey {
+            return URL(string: base.absoluteString + partKey + "?X-Plex-Token=" + token)
+        }
+        return api.imageURL(base: base, token: token, path: item.thumb)
+    }
+
     func openHomeSection(_ section: PlexDirectory) {
         guard let server = selectedServer else { return }
         select(library: makeRef(server: server, section: section))
@@ -943,6 +954,7 @@ final class PlexPlayerViewModel: ObservableObject {
 
     func open(item: PlexMetadata) {
         if item.isPlaylist { openPlaylist(item); return }
+        if item.isPhoto { photoItem = item; return }
         if item.isPlayable { playSingle(item); return }
         guard let base = baseURL, let token = serverToken else { return }
         Task {
@@ -975,13 +987,14 @@ final class PlexPlayerViewModel: ObservableObject {
     // MARK: Playback
 
     func playSingle(_ item: PlexMetadata) {
+        if item.isPhoto { photoItem = item; return }
         playQueue = [item]
         queueIndex = 0
         Task { await startPlayback(item, resumeAt: nil) }
     }
 
     func playAll(_ items: [PlexMetadata], shuffle: Bool) {
-        var queue = items.filter { $0.isPlayable }
+        var queue = items.filter { $0.isPlayable && !$0.isPhoto }
         guard !queue.isEmpty else { return }
         if shuffle { queue.shuffle() }
         playQueue = queue
@@ -1504,6 +1517,7 @@ struct PlexPlayerContainerView: View {
         .sheet(isPresented: $model.showQueue) { QueueView(model: model) }
         .sheet(isPresented: $model.showSettings) { PlexSettingsView(model: model) }
         .sheet(item: $model.infoItem) { item in MediaInfoView(model: model, item: item) }
+        .sheet(item: $model.photoItem) { item in PhotoViewerView(model: model, item: item) }
         .alert("Delete Failed",
                isPresented: Binding(get: { model.deleteError != nil },
                                     set: { if !$0 { model.deleteError = nil } })) {
@@ -1803,6 +1817,45 @@ private struct UniversalSearchResults: View {
             ForEach(items) { item in
                 PosterCard(model: model, item: item) { model.open(item: item) }
             }
+        }
+    }
+}
+
+// MARK: - Photo viewer
+
+private struct PhotoViewerView: View {
+    @ObservedObject var model: PlexPlayerViewModel
+    let item: PlexMetadata
+    @Environment(\.dismiss) private var dismiss
+    @State private var image: PlatformImage?
+    @State private var failed = false
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                Color.black.ignoresSafeArea()
+                if let image {
+                    Image(platformImage: image)
+                        .resizable()
+                        .scaledToFit()
+                } else if failed {
+                    Text("Couldn't load this photo.")
+                        .foregroundStyle(.white)
+                } else {
+                    ProgressView().tint(.white)
+                }
+            }
+            .navigationTitle(item.title)
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar { ToolbarItem { Button("Done") { dismiss() } } }
+        }
+        .frame(minWidth: 640, minHeight: 480)
+        .task(id: item.ratingKey) {
+            guard let url = model.photoURL(for: item) else { failed = true; return }
+            image = await ImageCache.shared.image(for: url)
+            if image == nil { failed = true }
         }
     }
 }

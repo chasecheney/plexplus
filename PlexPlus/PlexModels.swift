@@ -145,6 +145,15 @@ extension PlexMetadata {
 
     var isPlaylist: Bool { type == "playlist" }
 
+    /// Still images (photo libraries). These open in the photo viewer -
+    /// AVPlayer can't render them.
+    var isPhoto: Bool {
+        if type == "photo" || type == "picture" { return true }
+        let imageContainers: Set<String> = ["png", "jpg", "jpeg", "heic", "heif",
+                                            "gif", "webp", "bmp", "tif", "tiff"]
+        return imageContainers.contains((partContainer ?? "").lowercased())
+    }
+
     /// The on-disk filename of the first part, if known.
     var fileName: String? {
         guard let path = media?.first?.parts?.first?.file else { return nil }
