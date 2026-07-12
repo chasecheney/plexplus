@@ -1799,6 +1799,23 @@ private struct UniversalSearchResults: View {
                         ProgressView().controlSize(.small).padding(.leading, 2)
                     }
                     Spacer()
+                    let hasPlayable = model.searchResults.contains { $0.isPlayable && !$0.isPhoto }
+                    Button {
+                        model.playAll(model.searchResults, shuffle: false)
+                    } label: {
+                        Label("Play All", systemImage: "play.fill")
+                    }
+                    .font(.caption)
+                    .disabled(!hasPlayable)
+                    .help("Play all results (photos skipped)")
+                    Button {
+                        model.playAll(model.searchResults, shuffle: true)
+                    } label: {
+                        Label("Shuffle", systemImage: "shuffle")
+                    }
+                    .font(.caption)
+                    .disabled(!hasPlayable)
+                    .help("Shuffle all results (photos skipped)")
                     Menu {
                         Picker("Sort by", selection: Binding(get: { model.searchSortField },
                                                              set: { model.setSearchSortField($0) })) {
