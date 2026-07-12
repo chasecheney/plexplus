@@ -1106,6 +1106,12 @@ final class PlexPlayerViewModel: ObservableObject {
         duration = 0
         activeTranscodeSession = transcoding ? session : nil
 
+        #if os(iOS)
+        // Background playback: keep the audio session active so playback
+        // continues when the app is backgrounded (with the layer detached).
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+        try? AVAudioSession.sharedInstance().setActive(true)
+        #endif
         let player = AVPlayer(url: url)
         observeTime(player)
         if let resumeAt {
@@ -2967,22 +2973,59 @@ struct PlayerLayerView: UIViewRepresentable {
     let player: AVPlayer
     func makeUIView(context: Context) -> PlayerLayerUIView {
         let view = PlayerLayerUIView()
-        view.playerLayer.player = player
+        view.setPlayer(player)
         return view
     }
     func updateUIView(_ uiView: PlayerLayerUIView, context: Context) {
-        uiView.playerLayer.player = player
+        uiView.setPlayer(player)
     }
 }
 
 final class PlayerLayerUIView: UIView {
     override class var layerClass: AnyClass { AVPlayerLayer.self }
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+
+    /// iOS pauses any AVPlayer attached to an on-screen layer when the app
+    /// backgrounds. Detach the player while backgrounded (audio keeps going)
+    /// and reattach on return.
+    private var detachedPlayer: AVPlayer?
+
+    func setPlayer(_ player: AVPlayer) {
+        if detachedPlayer != nil {
+            detachedPlayer = player   // backgrounded: swap the pending player
+        } else {
+            playerLayer.player = player
+        }
+    }
+
+    private var backgroundObserver: NSObjectProtocol?
+    private var foregroundObserver: NSObjectProtocol?
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         playerLayer.videoGravity = .resizeAspect
         backgroundColor = .black
+        backgroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.detachedPlayer = self.playerLayer.player
+            self.playerLayer.player = nil
+        }
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, let player = self.detachedPlayer else { return }
+            self.playerLayer.player = player
+            self.detachedPlayer = nil
+        }
     }
+
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    deinit {
+        if let backgroundObserver { NotificationCenter.default.removeObserver(backgroundObserver) }
+        if let foregroundObserver { NotificationCenter.default.removeObserver(foregroundObserver) }
+    }
 }
 #endif
