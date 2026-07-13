@@ -144,6 +144,8 @@ final class PlexPlayerViewModel: ObservableObject {
     @Published private(set) var searchScope: SearchScope = .current
     /// Per-library groups when searching all libraries.
     @Published private(set) var searchSections: [SearchSection] = []
+    /// Server playlists whose titles match the query.
+    @Published private(set) var searchPlaylists: [PlexMetadata] = []
     /// This server's libraries, for the search-scope menu.
     @Published private(set) var searchScopeOptions: [PlexDirectory] = []
     /// Sort applied to search results (server-side).
@@ -890,6 +892,7 @@ final class PlexPlayerViewModel: ObservableObject {
                 searching = false
                 searchResults = []
                 searchSections = []
+                searchPlaylists = []
                 return
             }
             searchActive = true
@@ -904,6 +907,11 @@ final class PlexPlayerViewModel: ObservableObject {
                 return
             }
             let api = self.api
+            // Playlists are server-wide; match titles alongside the library search.
+            let playlistsTask = Task { () -> [PlexMetadata] in
+                let all = (try? await api.playlists(base: base, token: token)) ?? []
+                return all.filter { $0.title.localizedCaseInsensitiveContains(query) }
+            }
             switch effectiveSearchScope {
             case .all:
                 let libs = searchScopeOptions.isEmpty ? sections : searchScopeOptions
@@ -949,6 +957,11 @@ final class PlexPlayerViewModel: ObservableObject {
                 if Task.isCancelled { return }
                 searchSections = []
                 searchResults = results
+            }
+            let matchedPlaylists = await playlistsTask.value
+            if Task.isCancelled { return }
+            searchPlaylists = matchedPlaylists.sorted {
+                $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
             }
             searching = false
         }
@@ -1498,10 +1511,7 @@ final class PlexPlayerViewModel: ObservableObject {
         Task {
             do {
                 try await api.deleteItem(base: base, token: token, ratingKey: item.ratingKey)
-                // Remove it from anything currently on screen.
-                browseItems.removeAll { $0.id == item.id }
-                searchResults.removeAll { $0.id == item.id }
-                if !stack.isEmpty { stack[stack.count - 1].items.removeAll { $0.id == item.id } }
+                purge(ratingKey: item.ratingKey)
                 infoItem = nil
             } catch {
                 infoItem = nil
@@ -1510,6 +1520,34 @@ final class PlexPlayerViewModel: ObservableObject {
                 } else {
                     deleteError = "Couldn't delete this item. \(error.localizedDescription)"
                 }
+            }
+        }
+    }
+
+    /// Removes a deleted item from every collection currently in memory:
+    /// browse, search (flat + grouped), home rows, every drill level
+    /// (including opened playlists), and the play queue.
+    private func purge(ratingKey: String) {
+        browseItems.removeAll { $0.ratingKey == ratingKey }
+        searchResults.removeAll { $0.ratingKey == ratingKey }
+        for index in searchSections.indices {
+            searchSections[index].items.removeAll { $0.ratingKey == ratingKey }
+        }
+        searchSections.removeAll { $0.items.isEmpty }
+        onDeck.removeAll { $0.ratingKey == ratingKey }
+        recentlyAdded.removeAll { $0.ratingKey == ratingKey }
+        for index in stack.indices {
+            stack[index].items.removeAll { $0.ratingKey == ratingKey }
+        }
+        if nowPlayingItem?.ratingKey == ratingKey {
+            closePlayer() // also clears the queue
+        } else if !playQueue.isEmpty {
+            let current = playQueue.indices.contains(queueIndex) ? playQueue[queueIndex] : nil
+            playQueue.removeAll { $0.ratingKey == ratingKey }
+            if let current {
+                queueIndex = playQueue.firstIndex { $0.ratingKey == current.ratingKey } ?? 0
+            } else {
+                queueIndex = min(queueIndex, max(0, playQueue.count - 1))
             }
         }
     }
@@ -1786,9 +1824,9 @@ private struct UniversalSearchResults: View {
     private let columns = [GridItem(.adaptive(minimum: 140), spacing: 16)]
 
     var body: some View {
-        if model.searching && model.searchResults.isEmpty {
+        if model.searching && model.searchResults.isEmpty && model.searchPlaylists.isEmpty {
             LoadingBanner(text: "Searching\u{2026}")
-        } else if model.searchResults.isEmpty {
+        } else if model.searchResults.isEmpty && model.searchPlaylists.isEmpty {
             EmptyBanner(text: "No results for \u{201C}\(model.searchText)\u{201D}.")
         } else {
             VStack(spacing: 0) {
@@ -1865,6 +1903,15 @@ private struct UniversalSearchResults: View {
                 }
                 .padding(.horizontal, 14).padding(.vertical, 6)
                 ScrollView {
+                    if !model.searchPlaylists.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("Playlists  (\(model.searchPlaylists.count))",
+                                  systemImage: "music.note.list")
+                                .font(.headline)
+                            grid(model.searchPlaylists)
+                        }
+                        .padding(.horizontal).padding(.top)
+                    }
                     if model.searchSections.isEmpty {
                         grid(model.searchResults).padding()
                     } else {
