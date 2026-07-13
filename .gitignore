@@ -17,3 +17,8 @@ xcuserdata/
 # Swift Package Manager
 .build/
 Packages/
+
+# Release artifacts
+*.dmg
+*.dmg.sha256
+RELEASE_NOTES*.md
