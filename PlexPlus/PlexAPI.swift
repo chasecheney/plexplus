@@ -586,6 +586,7 @@ enum PlexSortField: String, CaseIterable, Identifiable {
     case name = "Name"
     case releaseDate = "Release Date"
     case dateAdded = "Date Added"
+    case duration = "Duration"
 
     var id: String { rawValue }
 
@@ -594,6 +595,7 @@ enum PlexSortField: String, CaseIterable, Identifiable {
         case .name: return "titleSort"
         case .releaseDate: return "originallyAvailableAt"
         case .dateAdded: return "addedAt"
+        case .duration: return "duration"
         }
     }
 }
