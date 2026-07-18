@@ -184,6 +184,29 @@ final class PlexAPI {
         try await metadataList(path: "/library/recentlyAdded", base: base, token: token)
     }
 
+    /// Plex matches the `title` filter against the *sort* title, which strips
+    /// leading articles ("The West Wing" indexes as "West Wing") - so a query
+    /// typed with the article can return nothing. Run the query as typed plus
+    /// an article-stripped variant and merge, deduplicated by ratingKey.
+    func searchLibrarySmart(base: URL, token: String, sectionKey: String,
+                            type: Int?, query: String, sort: String? = nil) async throws -> [PlexMetadata] {
+        var variants = [query]
+        let lowered = query.lowercased()
+        for article in ["the ", "a ", "an "] where lowered.hasPrefix(article) && query.count > article.count {
+            variants.append(String(query.dropFirst(article.count)))
+        }
+        var seen = Set<String>()
+        var merged: [PlexMetadata] = []
+        for variant in variants {
+            let items = (try? await searchLibrary(base: base, token: token, sectionKey: sectionKey,
+                                                  type: type, query: variant, sort: sort)) ?? []
+            for item in items where seen.insert(item.ratingKey).inserted {
+                merged.append(item)
+            }
+        }
+        return merged
+    }
+
     /// A page of items in a section, filtered by `type` (1 = movie, 2 = show,
     /// 4 = episode) and sorted (e.g. "addedAt:desc"). Paginated via
     /// `X-Plex-Container-Start/Size` so enormous libraries load a page at a time

@@ -921,10 +921,10 @@ final class PlexPlayerViewModel: ObservableObject {
                         let sort = searchSortString
                         group.addTask {
                             let type: Int? = lib.type == "show" ? 2 : nil
-                            let items = (try? await api.searchLibrary(base: base, token: token,
-                                                                      sectionKey: lib.key,
-                                                                      type: type, query: query,
-                                                                      sort: sort)) ?? []
+                            let items = (try? await api.searchLibrarySmart(base: base, token: token,
+                                                                           sectionKey: lib.key,
+                                                                           type: type, query: query,
+                                                                           sort: sort)) ?? []
                             return items.isEmpty ? nil : SearchSection(library: lib, items: items)
                         }
                     }
@@ -950,10 +950,10 @@ final class PlexPlayerViewModel: ObservableObject {
                 if libType == "show" {
                     if case .current = effectiveSearchScope { type = tvEpisodes ? 4 : 2 } else { type = 2 }
                 }
-                let results = (try? await api.searchLibrary(base: base, token: token,
-                                                            sectionKey: key,
-                                                            type: type, query: query,
-                                                            sort: searchSortString)) ?? []
+                let results = (try? await api.searchLibrarySmart(base: base, token: token,
+                                                                 sectionKey: key,
+                                                                 type: type, query: query,
+                                                                 sort: searchSortString)) ?? []
                 if Task.isCancelled { return }
                 searchSections = []
                 searchResults = results
