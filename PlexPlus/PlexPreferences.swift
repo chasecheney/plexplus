@@ -17,6 +17,9 @@ final class PlexPreferences: ObservableObject {
     @Published private(set) var showDeleteOption = false
     @Published private(set) var preferredQuality: PlexQuality = .original
     @Published private(set) var showNetworkDebug = false
+    /// Play original files in-app with the Aether engine (FFmpeg demux +
+    /// VideoToolbox decode) instead of asking the server to transcode.
+    @Published private(set) var useAetherPlayer = false
 
     private let favoritesKey = "plex.favoriteLibraries"
     private let sortFieldKey = "plex.sortField"
@@ -24,6 +27,7 @@ final class PlexPreferences: ObservableObject {
     private let showDeleteKey = "plex.showDeleteOption"
     private let preferredQualityKey = "plex.preferredQuality"
     private let showNetDebugKey = "plex.showNetworkDebug"
+    private let useAetherKey = "plex.useAetherPlayer"
 
     private init() {
         if let data = UserDefaults.standard.data(forKey: favoritesKey),
@@ -40,6 +44,7 @@ final class PlexPreferences: ObservableObject {
         }
         showDeleteOption = UserDefaults.standard.bool(forKey: showDeleteKey)
         showNetworkDebug = UserDefaults.standard.bool(forKey: showNetDebugKey)
+        useAetherPlayer = UserDefaults.standard.bool(forKey: useAetherKey)
         if let raw = UserDefaults.standard.string(forKey: preferredQualityKey),
            let quality = PlexQuality(rawValue: raw) {
             preferredQuality = quality
@@ -56,6 +61,11 @@ final class PlexPreferences: ObservableObject {
     func setShowNetworkDebug(_ value: Bool) {
         showNetworkDebug = value
         UserDefaults.standard.set(value, forKey: showNetDebugKey)
+    }
+
+    func setUseAetherPlayer(_ value: Bool) {
+        useAetherPlayer = value
+        UserDefaults.standard.set(value, forKey: useAetherKey)
     }
 
     func setPreferredQuality(_ quality: PlexQuality) {

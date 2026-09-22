@@ -64,6 +64,9 @@
 				BB0000000000000000000002 /* PlexPlus */,
 			);
 			name = PlexPlus;
+			packageProductDependencies = (
+				BB0000000000000000000011 /* AetherEngine */,
+			);
 			productName = PlexPlus;
 			productReference = BB0000000000000000000001 /* PlexPlus.app */;
 			productType = "com.apple.product-type.application";
@@ -92,6 +95,9 @@
 			);
 			mainGroup = BB0000000000000000000004;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				BB0000000000000000000010 /* XCRemoteSwiftPackageReference "AetherEngine" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = BB0000000000000000000005 /* Products */;
 			projectDirPath = "";
@@ -345,6 +351,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		BB0000000000000000000010 /* XCRemoteSwiftPackageReference "AetherEngine" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/blurbery/AetherEngine";
+			requirement = {
+				kind = upToNextMinorVersion;
+				minimumVersion = 6.64.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		BB0000000000000000000011 /* AetherEngine */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = BB0000000000000000000010 /* XCRemoteSwiftPackageReference "AetherEngine" */;
+			productName = AetherEngine;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = BB0000000000000000000007 /* Project object */;
 }

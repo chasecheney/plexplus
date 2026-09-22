@@ -1,6 +1,8 @@
 import SwiftUI
 import AVKit
 import AVFoundation
+import Combine
+import AetherEngine
 #if os(macOS)
 import AppKit
 #else
@@ -185,6 +187,15 @@ final class PlexPlayerViewModel: ObservableObject {
 
     // Player
     @Published var player: AVPlayer?
+    /// Non-nil while the Aether engine is playing the current item (in-app
+    /// FFmpeg demux + VideoToolbox decode, no server transcode). Mutually
+    /// exclusive with `player`.
+    @Published private(set) var aetherEngine: AetherEngine?
+    /// The engine instance is long-lived (audio session + display pipeline are
+    /// expensive); it is kept here across items and re-`load`ed each time.
+    private var aetherHolder: AetherEngine?
+    private var aetherCancellables: Set<AnyCancellable> = []
+    private var aetherChaseSeconds: Double = 0
     @Published private(set) var nowPlayingTitle: String?
     @Published private(set) var nowPlayingItem: PlexMetadata?
     @Published var isPlayerMinimized = false
@@ -1042,14 +1053,14 @@ final class PlexPlayerViewModel: ObservableObject {
     /// is playing).
     func playNext(_ item: PlexMetadata) {
         guard item.isPlayable, !item.isPhoto else { return }
-        guard player != nil else { playSingle(item); return }
+        guard hasActivePlayback else { playSingle(item); return }
         playQueue.insert(item, at: min(queueIndex + 1, playQueue.count))
     }
 
     /// Append `item` to the end of the queue (or start it if nothing is playing).
     func addToQueue(_ item: PlexMetadata) {
         guard item.isPlayable, !item.isPhoto else { return }
-        guard player != nil else { playSingle(item); return }
+        guard hasActivePlayback else { playSingle(item); return }
         playQueue.append(item)
     }
 
@@ -1081,26 +1092,12 @@ final class PlexPlayerViewModel: ObservableObject {
         }
         guard generation == playbackGeneration else { return } // a newer call won
 
-        let session = UUID().uuidString
-        let transcoding = forceTranscodeNext || api.willTranscode(item: item, quality: quality)
-        let chosenURL: URL? = forceTranscodeNext
-            ? api.transcodeURL(base: base, token: token, item: item, quality: quality, session: session)
-            : api.playbackURL(base: base, token: token, item: item, quality: quality, session: session)
-        forceTranscodeNext = false
-        guard let url = chosenURL else { return }
-        NetworkLog.record(url: url, start: Date(),
-                          label: transcoding ? "AVPlayer start (transcode)" : "AVPlayer start (direct play)")
-        if transcoding {
-            Task { await api.logTranscodeDecision(base: base, token: token, item: item,
-                                                  quality: quality, session: session) }
-        }
-
         // Report the outgoing item as stopped and stop its transcode session.
         reportTimeline("stopped")
         stopActiveTranscode()
 
-        // Fully stop the outgoing player so its audio doesn't keep playing
-        // while the new item takes over.
+        // Fully stop the outgoing player (either engine) so its audio doesn't
+        // keep playing while the new item takes over.
         statusObservation?.invalidate()
         statusObservation = nil
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
@@ -1117,6 +1114,32 @@ final class PlexPlayerViewModel: ObservableObject {
         }
         currentTime = 0
         duration = 0
+
+        // Aether path: play the original file in-app (FFmpeg demux +
+        // VideoToolbox decode) with no server transcode. Original quality
+        // only - picking a lower quality still goes through the server
+        // transcoder. On failure the engine path re-enters this function
+        // with forceTranscodeNext set, landing in the AVPlayer path below.
+        if prefs.useAetherPlayer, !forceTranscodeNext, quality == .original,
+           !item.isPhoto, item.partKey != nil {
+            await startAetherPlayback(item, resumeAt: resumeAt, generation: generation)
+            return
+        }
+        stopAetherSession()
+
+        let session = UUID().uuidString
+        let transcoding = forceTranscodeNext || api.willTranscode(item: item, quality: quality)
+        let chosenURL: URL? = forceTranscodeNext
+            ? api.transcodeURL(base: base, token: token, item: item, quality: quality, session: session)
+            : api.playbackURL(base: base, token: token, item: item, quality: quality, session: session)
+        forceTranscodeNext = false
+        guard let url = chosenURL else { return }
+        NetworkLog.record(url: url, start: Date(),
+                          label: transcoding ? "AVPlayer start (transcode)" : "AVPlayer start (direct play)")
+        if transcoding {
+            Task { await api.logTranscodeDecision(base: base, token: token, item: item,
+                                                  quality: quality, session: session) }
+        }
         activeTranscodeSession = transcoding ? session : nil
 
         #if os(iOS)
@@ -1149,6 +1172,181 @@ final class PlexPlayerViewModel: ObservableObject {
         reportTimeline("playing")
         if let currentItem = player.currentItem {
             Task { await loadTracks(for: currentItem) }
+        }
+    }
+
+    // MARK: Aether playback
+
+    /// Whether anything is currently loaded in either player.
+    var hasActivePlayback: Bool { player != nil || aetherEngine != nil }
+
+    private func startAetherPlayback(_ item: PlexMetadata, resumeAt: CMTime?, generation: Int) async {
+        guard let base = baseURL, let token = serverToken,
+              let url = api.directPlayURL(base: base, token: token, item: item) else {
+            forceTranscodeNext = true
+            await startPlayback(item, resumeAt: resumeAt)
+            return
+        }
+
+        let engine: AetherEngine
+        if let existing = aetherHolder {
+            engine = existing
+            engine.stop()
+        } else {
+            do {
+                engine = try AetherEngine()
+            } catch {
+                NetworkLog.record(url: url, start: Date(),
+                                  error: (error as NSError).localizedDescription,
+                                  label: "Aether engine init FAILED")
+                forceTranscodeNext = true
+                await startPlayback(item, resumeAt: resumeAt)
+                return
+            }
+            aetherHolder = engine
+        }
+
+        nowPlayingItem = item
+        nowPlayingTitle = item.type == "episode"
+            ? [item.grandparentTitle, item.title].compactMap { $0 }.joined(separator: " — ")
+            : item.title
+        audioTracks = []
+        subtitleTracks = [MediaTrack(id: -1, name: "Off")]
+        currentAudioID = nil
+        currentSubtitleID = -1
+        audioGroup = nil
+        subtitleGroup = nil
+
+        observeAether(engine, item: item, generation: generation)
+        withAnimation(.easeInOut(duration: 0.25)) {
+            aetherEngine = engine
+            isPlayerMinimized = false
+        }
+
+        let resumeSeconds: Double? = {
+            if let resumeAt, resumeAt.seconds.isFinite, resumeAt.seconds > 0 { return resumeAt.seconds }
+            if let offsetMs = item.viewOffset, offsetMs > 0 { return Double(offsetMs) / 1000.0 }
+            return nil
+        }()
+
+        NetworkLog.record(url: url, start: Date(), label: "Aether start (direct play)")
+        do {
+            try await engine.load(url: url, startPosition: resumeSeconds)
+            guard generation == playbackGeneration else { return }
+            engine.volume = Float(isMuted ? 0 : volume)
+            engine.play()
+            reportTimeline("playing")
+        } catch {
+            guard generation == playbackGeneration else { return }
+            NetworkLog.record(url: url, start: Date(),
+                              error: (error as NSError).localizedDescription,
+                              label: "Aether FAILED - falling back to transcode")
+            stopAetherSession()
+            forceTranscodeNext = true
+            await startPlayback(item, resumeAt: resumeAt)
+        }
+    }
+
+    private func observeAether(_ engine: AetherEngine, item: PlexMetadata, generation: Int) {
+        aetherCancellables.removeAll()
+
+        engine.$state.sink { [weak self] state in
+            Task { @MainActor in self?.handleAetherState(state, item: item, generation: generation) }
+        }.store(in: &aetherCancellables)
+
+        engine.clock.$currentTime.sink { [weak self] seconds in
+            Task { @MainActor in
+                guard let self, generation == self.playbackGeneration else { return }
+                if seconds.isFinite { self.currentTime = seconds }
+                // Report progress to Plex ~every 10s while playing.
+                if self.isPlaying, Date().timeIntervalSince(self.lastTimelineReport) >= 10 {
+                    self.reportTimeline("playing")
+                }
+            }
+        }.store(in: &aetherCancellables)
+
+        engine.$duration.sink { [weak self] seconds in
+            Task { @MainActor in
+                guard let self, generation == self.playbackGeneration else { return }
+                if seconds.isFinite, seconds > 0 { self.duration = seconds }
+            }
+        }.store(in: &aetherCancellables)
+
+        engine.$audioTracks.sink { [weak self] tracks in
+            Task { @MainActor in
+                guard let self, generation == self.playbackGeneration else { return }
+                self.audioTracks = tracks.map { MediaTrack(id: $0.id, name: $0.name) }
+            }
+        }.store(in: &aetherCancellables)
+
+        engine.$subtitleTracks.sink { [weak self] tracks in
+            Task { @MainActor in
+                guard let self, generation == self.playbackGeneration else { return }
+                self.subtitleTracks = [MediaTrack(id: -1, name: "Off")]
+                    + tracks.map { MediaTrack(id: $0.id, name: $0.name) }
+            }
+        }.store(in: &aetherCancellables)
+
+        engine.$activeAudioTrackIndex.sink { [weak self] index in
+            Task { @MainActor in
+                guard let self, generation == self.playbackGeneration else { return }
+                self.currentAudioID = index
+            }
+        }.store(in: &aetherCancellables)
+
+        engine.$activeSubtitleTrackIndex.sink { [weak self] index in
+            Task { @MainActor in
+                guard let self, generation == self.playbackGeneration else { return }
+                self.currentSubtitleID = index ?? -1
+            }
+        }.store(in: &aetherCancellables)
+    }
+
+    private func handleAetherState(_ state: PlaybackState, item: PlexMetadata, generation: Int) {
+        guard generation == playbackGeneration else { return }
+        switch state {
+        case .playing:
+            isPlaying = true
+        case .paused, .loading, .seeking, .idle:
+            isPlaying = false
+        case .ended:
+            isPlaying = false
+            advanceQueue()
+        case .error(let message):
+            isPlaying = false
+            NetworkLog.record(url: URL(string: "aether://playback") ?? URL(fileURLWithPath: "/"),
+                              start: Date(), error: message,
+                              label: "Aether FAILED - falling back to transcode")
+            let resume = currentTime > 5 ? CMTime(seconds: currentTime, preferredTimescale: 600) : nil
+            stopAetherSession()
+            forceTranscodeNext = true
+            Task { await startPlayback(item, resumeAt: resume) }
+        }
+    }
+
+    /// Stops the Aether session (keeping the engine instance for reuse) and
+    /// detaches it from the UI.
+    private func stopAetherSession() {
+        aetherCancellables.removeAll()
+        aetherHolder?.stop()
+        if aetherEngine != nil {
+            withAnimation(.easeInOut(duration: 0.25)) { aetherEngine = nil }
+        }
+    }
+
+    /// Coalesced live seeking for the Aether engine (`seek` is async; keep at
+    /// most one in flight and chase the newest target).
+    private func aetherSeekToChase() {
+        guard let engine = aetherEngine else { isSeekInProgress = false; return }
+        isSeekInProgress = true
+        let target = aetherChaseSeconds
+        Task { @MainActor in
+            await engine.seek(to: target)
+            if self.aetherChaseSeconds == target {
+                self.isSeekInProgress = false
+            } else {
+                self.aetherSeekToChase()
+            }
         }
     }
 
@@ -1207,6 +1405,11 @@ final class PlexPlayerViewModel: ObservableObject {
     }
 
     func selectAudio(_ id: Int) {
+        if let engine = aetherEngine {
+            engine.selectAudioTrack(index: id)
+            currentAudioID = id
+            return
+        }
         guard let group = audioGroup, group.options.indices.contains(id),
               let item = player?.currentItem else { return }
         item.select(group.options[id], in: group)
@@ -1214,6 +1417,11 @@ final class PlexPlayerViewModel: ObservableObject {
     }
 
     func selectSubtitle(_ id: Int) {
+        if let engine = aetherEngine {
+            if id < 0 { engine.clearSubtitle() } else { engine.selectSubtitleTrack(index: id) }
+            currentSubtitleID = id < 0 ? -1 : id
+            return
+        }
         guard let group = subtitleGroup, let item = player?.currentItem else { return }
         if id < 0 {
             item.select(nil, in: group)
@@ -1357,15 +1565,24 @@ final class PlexPlayerViewModel: ObservableObject {
 
     /// Seek to a fraction (0…1) of the item's duration.
     func seek(toFraction fraction: Double) {
-        guard let player, duration > 0 else { return }
+        guard duration > 0 else { return }
         let target = max(0, min(1, fraction)) * duration
         currentTime = target
-        player.seek(to: CMTime(seconds: target, preferredTimescale: 600))
+        if let engine = aetherEngine {
+            Task { await engine.seek(to: target) }
+        } else if let player {
+            player.seek(to: CMTime(seconds: target, preferredTimescale: 600))
+        }
     }
 
     // MARK: Live scrubbing
 
     func beginScrub() {
+        if let engine = aetherEngine {
+            wasPlayingBeforeScrub = engine.state == .playing
+            engine.pause()
+            return
+        }
         wasPlayingBeforeScrub = player?.timeControlStatus == .playing
         player?.pause()
     }
@@ -1375,13 +1592,20 @@ final class PlexPlayerViewModel: ObservableObject {
         guard duration > 0 else { return }
         let target = max(0, min(1, fraction)) * duration
         currentTime = target
+        if aetherEngine != nil {
+            aetherChaseSeconds = target
+            if !isSeekInProgress { aetherSeekToChase() }
+            return
+        }
         chaseTime = CMTime(seconds: target, preferredTimescale: 600)
         if !isSeekInProgress { seekToChaseTime() }
     }
 
     func endScrub(toFraction fraction: Double) {
         scrub(toFraction: fraction)
-        if wasPlayingBeforeScrub { player?.play() }
+        if wasPlayingBeforeScrub {
+            if let engine = aetherEngine { engine.play() } else { player?.play() }
+        }
     }
 
     private func seekToChaseTime() {
@@ -1401,10 +1625,14 @@ final class PlexPlayerViewModel: ObservableObject {
     }
 
     func skip(by seconds: Double) {
-        guard let player, duration > 0 else { return }
+        guard duration > 0 else { return }
         let target = max(0, min(duration, currentTime + seconds))
         currentTime = target
-        player.seek(to: CMTime(seconds: target, preferredTimescale: 600))
+        if let engine = aetherEngine {
+            Task { await engine.seek(to: target) }
+        } else if let player {
+            player.seek(to: CMTime(seconds: target, preferredTimescale: 600))
+        }
     }
 
     private func observeEnd(of player: AVPlayer) {
@@ -1417,6 +1645,16 @@ final class PlexPlayerViewModel: ObservableObject {
     }
 
     func togglePlayPause() {
+        if let engine = aetherEngine {
+            if engine.state == .playing {
+                engine.pause()
+                reportTimeline("paused")
+            } else {
+                engine.play()
+                reportTimeline("playing")
+            }
+            return
+        }
         guard let player else { return }
         if player.timeControlStatus == .playing {
             player.pause()
@@ -1435,11 +1673,13 @@ final class PlexPlayerViewModel: ObservableObject {
             isMuted = false
             player?.isMuted = false
         }
+        aetherEngine?.volume = Float(isMuted ? 0 : volume)
     }
 
     func toggleMute() {
         isMuted.toggle()
         player?.isMuted = isMuted
+        aetherEngine?.volume = Float(isMuted ? 0 : volume)
     }
 
     func minimizePlayer() { withAnimation(.easeInOut(duration: 0.25)) { isPlayerMinimized = true } }
@@ -1448,6 +1688,7 @@ final class PlexPlayerViewModel: ObservableObject {
     func closePlayer() {
         reportTimeline("stopped")
         stopActiveTranscode()
+        stopAetherSession()
         statusObservation?.invalidate()
         statusObservation = nil
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
@@ -1481,8 +1722,18 @@ final class PlexPlayerViewModel: ObservableObject {
     func setQuality(_ newQuality: PlexQuality) {
         guard newQuality != quality else { return }
         quality = newQuality
-        guard let item = nowPlayingItem, let player else { return }
-        let resume = player.currentTime()
+        guard let item = nowPlayingItem, hasActivePlayback else { return }
+        let resume = player?.currentTime() ?? CMTime(seconds: currentTime, preferredTimescale: 600)
+        Task { await startPlayback(item, resumeAt: resume) }
+    }
+
+    /// Toggles the Aether player preference; if something is playing, restarts
+    /// it under the newly chosen engine at the same position.
+    func setUseAetherPlayer(_ enabled: Bool) {
+        guard enabled != prefs.useAetherPlayer else { return }
+        prefs.setUseAetherPlayer(enabled)
+        guard let item = nowPlayingItem, hasActivePlayback else { return }
+        let resume = player?.currentTime() ?? CMTime(seconds: currentTime, preferredTimescale: 600)
         Task { await startPlayback(item, resumeAt: resume) }
     }
 
@@ -1624,14 +1875,14 @@ struct PlexPlayerContainerView: View {
 
     @ViewBuilder
     private var miniBar: some View {
-        if model.player != nil && model.isPlayerMinimized {
+        if model.hasActivePlayback && model.isPlayerMinimized {
             MiniPlayerBar(model: model).transition(.move(edge: .bottom))
         }
     }
 
     @ViewBuilder
     private var fullPlayer: some View {
-        if model.player != nil && !model.isPlayerMinimized {
+        if model.hasActivePlayback && !model.isPlayerMinimized {
             FullPlayerView(model: model).transition(.opacity)
         }
     }
@@ -2459,6 +2710,11 @@ private struct MiniPlayerBar: View {
                     .frame(width: 120, height: 68)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                     .allowsHitTesting(false)
+            } else if let engine = model.aetherEngine {
+                AetherPlayerSurface(engine: engine)
+                    .frame(width: 120, height: 68)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .allowsHitTesting(false)
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text(model.nowPlayingTitle ?? "Now Playing").font(.subheadline).lineLimit(1)
@@ -2527,11 +2783,11 @@ private struct FullPlayerView: View {
         GeometryReader { geo in
             ZStack {
                 Color.black.ignoresSafeArea()
-                if let player = model.player {
+                if model.hasActivePlayback {
                     let panOffset = clampedPan(
                         CGSize(width: pan.width + dragPan.width, height: pan.height + dragPan.height),
                         scale: effectiveScale, in: geo.size)
-                    PlayerLayerView(player: player)
+                    videoSurface
                         .scaleEffect(effectiveScale)
                         .offset(x: panOffset.width, y: panOffset.height)
                         .ignoresSafeArea()
@@ -2595,6 +2851,20 @@ private struct FullPlayerView: View {
             isFullScreen = false
         }
         #endif
+    }
+
+    /// The active video surface: the AVPlayer layer, or the Aether engine's
+    /// surface with the host-drawn subtitle overlay on top.
+    @ViewBuilder
+    private var videoSurface: some View {
+        if let player = model.player {
+            PlayerLayerView(player: player)
+        } else if let engine = model.aetherEngine {
+            ZStack {
+                AetherPlayerSurface(engine: engine)
+                AetherSubtitleOverlay(engine: engine)
+            }
+        }
     }
 
     private func doubleTapSeek(x: CGFloat, width: CGFloat) {
@@ -2872,6 +3142,16 @@ private struct PlexSettingsView: View {
                     Text("Playback")
                 } footer: {
                     Text("Default quality when a video starts. You can still change it during playback.")
+                }
+
+                Section {
+                    Toggle("Use Aether player (beta)",
+                           isOn: Binding(get: { prefs.useAetherPlayer },
+                                         set: { model.setUseAetherPlayer($0) }))
+                } header: {
+                    Text("Player Engine")
+                } footer: {
+                    Text("Plays the original file in-app (MKV, AVI, AV1, DTS and more) with no server transcoding. Applies at Original quality; lower qualities still use the server transcoder. If a file can't be opened, playback falls back to the transcoder automatically.")
                 }
 
                 Section {

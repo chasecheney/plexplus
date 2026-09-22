@@ -353,6 +353,14 @@ final class PlexAPI {
         return transcodeURL(base: base, token: token, item: item, quality: quality, session: session)
     }
 
+    /// The raw file URL for the item's first part, regardless of container.
+    /// Used by the Aether engine path, which demuxes/decodes in-app and so
+    /// can direct-play formats AVFoundation rejects (MKV, AVI, AV1, VC-1 …).
+    func directPlayURL(base: URL, token: String, item: PlexMetadata) -> URL? {
+        guard let partKey = item.partKey else { return nil }
+        return URL(string: base.absoluteString + partKey + "?X-Plex-Token=" + token)
+    }
+
     /// Whether AVFoundation can most likely play the file as-is. The container
     /// is the deciding factor: AVPlayer opens mp4/mov/m4v and natively handles
     /// the codecs commonly inside them (H.264/HEVC video; AAC/MP3/ALAC and
