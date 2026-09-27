@@ -625,14 +625,50 @@ final class PlexPlayerViewModel: ObservableObject {
         }
     }
 
-    func loadRecommended() {
-        guard let ref = currentLibrary, let base = baseURL, let token = serverToken else { return }
+    /// Pull-to-refresh: refetches the visible screen from the server and
+    /// returns once the fresh data has landed (so the spinner tracks it).
+    func refreshCurrentView() async {
+        if currentLibrary == nil {
+            await refreshHome()
+            return
+        }
+        switch libraryTab {
+        case .recommended: await loadRecommended().value
+        case .browse: await loadBrowse().value
+        case .playlists: await loadPlaylists().value
+        }
+    }
+
+    /// Silently refetches the Home rows (On Deck, Recently Added, libraries)
+    /// without blanking the UI - used by pull-to-refresh.
+    func refreshHome() async {
+        guard let base = baseURL, let token = serverToken else { return }
+        homeEpoch += 1
+        let epoch = homeEpoch
+        async let deck = try? api.onDeck(base: base, token: token)
+        async let recent = try? api.recentlyAdded(base: base, token: token)
+        async let secs = try? api.sections(base: base, token: token)
+        let newDeck = await deck ?? []
+        let newRecent = await recent ?? []
+        let newSections = await secs ?? []
+        guard epoch == homeEpoch else { return } // superseded by a full load
+        onDeck = newDeck
+        recentlyAdded = newRecent
+        if !newSections.isEmpty {
+            sections = newSections
+            searchScopeOptions = newSections
+        }
+    }
+
+    @discardableResult
+    func loadRecommended() -> Task<Void, Never> {
+        guard let ref = currentLibrary, let base = baseURL, let token = serverToken else { return Task {} }
         tabLoading = true
         recommendedHubs = []
         let start = Date()
         recommendedNet = NetStat(label: "Recommended", path: "/hubs/sections/\(ref.sectionKey)",
                                  phase: "connecting")
-        Task {
+        return Task {
             do {
                 let hubs = try await api.hubs(
                     base: base, token: token, sectionKey: ref.sectionKey,
@@ -662,10 +698,11 @@ final class PlexPlayerViewModel: ObservableObject {
         }
     }
 
-    func loadPlaylists() {
-        guard let ref = currentLibrary, let base = baseURL, let token = serverToken else { return }
+    @discardableResult
+    func loadPlaylists() -> Task<Void, Never> {
+        guard let ref = currentLibrary, let base = baseURL, let token = serverToken else { return Task {} }
         tabLoading = true
-        Task {
+        return Task {
             let items = (try? await api.playlists(base: base, token: token)) ?? []
             // Discard if the user switched libraries while we were loading.
             guard currentLibrary?.id == ref.id else { return }
@@ -674,8 +711,9 @@ final class PlexPlayerViewModel: ObservableObject {
         }
     }
 
-    func loadBrowse() {
-        guard let ref = currentLibrary, let base = baseURL, let token = serverToken else { return }
+    @discardableResult
+    func loadBrowse() -> Task<Void, Never> {
+        guard let ref = currentLibrary, let base = baseURL, let token = serverToken else { return Task {} }
         let type: Int? = ref.type == "show" ? (tvEpisodes ? 4 : 2) : nil
         let sort = sortField.key + (sortAscending ? ":asc" : ":desc")
         let cacheKey = "\(ref.id)|type=\(type ?? -1)|sort=\(sort)"
@@ -697,7 +735,7 @@ final class PlexPlayerViewModel: ObservableObject {
                             path: "/library/sections/\(ref.sectionKey)/all (page 0, size \(browsePageSize))",
                             phase: "connecting")
 
-        Task {
+        return Task {
             do {
                 let items = try await api.sectionItems(
                     base: base, token: token, sectionKey: ref.sectionKey,
@@ -1959,6 +1997,7 @@ private struct BrowseView: View {
                 LibraryRootView(model: model)
             } else {
                 ScrollView { HomeView(model: model) }
+                    .refreshable { await model.refreshHome() }
             }
         }
     }
@@ -2311,6 +2350,7 @@ private struct RecommendedTab: View {
                 }
                 .padding()
             }
+            .refreshable { await model.refreshCurrentView() }
         }
     }
 }
@@ -2362,6 +2402,7 @@ private struct BrowseTab: View {
                         ProgressView().padding()
                     }
                 }
+                .refreshable { await model.refreshCurrentView() }
             }
         }
     }
@@ -2427,6 +2468,7 @@ private struct PlaylistsTab: View {
                 }
                 .padding()
             }
+            .refreshable { await model.refreshCurrentView() }
         }
     }
 }

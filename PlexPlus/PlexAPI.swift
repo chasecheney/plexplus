@@ -68,6 +68,9 @@ final class PlexAPI {
                          body: Data? = nil, contentType: String? = nil,
                          timeout: TimeInterval = 15) async throws -> Data {
         var req = URLRequest(url: url, timeoutInterval: timeout)
+        // Library data must always be fresh (browse lists, On Deck, search);
+        // never serve a URLCache copy of an API response.
+        req.cachePolicy = .reloadIgnoringLocalCacheData
         req.httpMethod = method
         for (k, v) in headers(token: token) { req.setValue(v, forHTTPHeaderField: k) }
         if let contentType { req.setValue(contentType, forHTTPHeaderField: "Content-Type") }
@@ -282,6 +285,9 @@ final class PlexAPI {
                    onProgress: @escaping (Int) -> Void = { _ in }) async throws -> Data {
         let url = URL(string: base.absoluteString + path)!
         var req = URLRequest(url: url, timeoutInterval: timeout)
+        // Never serve a URLCache copy - a browse sorted by Date Added must
+        // reflect what's on the server right now.
+        req.cachePolicy = .reloadIgnoringLocalCacheData
         for (k, v) in headers(token: token) { req.setValue(v, forHTTPHeaderField: k) }
         let observer = PlexProgressObserver(onResponse: onResponse, onProgress: onProgress)
         let start = Date()
